@@ -48,6 +48,12 @@ data/raw/
 data/processed/
 snapshots/
 
+# ...but the model card is tracked. It is a few hundred bytes, it records the
+# honest out-of-fold metrics, and live_detect.py reads its advisory_only flag
+# to decide whether the classifier may influence a student's state. Shipping
+# the model without it would silently re-enable a near-chance classifier.
+!models/model_meta.json
+
 # IDE & Editor
 .vscode/
 .idea/

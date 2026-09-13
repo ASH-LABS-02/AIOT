@@ -1,0 +1,31 @@
+# ClassSense AI - pinned to what this project was built and measured against.
+# Python 3.14.5
+#
+#   python -m venv classsense-env
+#   classsense-env\Scripts\activate          (Windows)
+#   pip install -r requirements.txt
+
+# Vision
+opencv-python==4.13.0.92
+mediapipe==0.10.35
+ultralytics==8.4.83
+
+# torch arrives as a CPU build by default, which is what the throughput numbers
+# in the README were measured on. For an NVIDIA GPU install the CUDA wheel
+# instead, before this file:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+torch==2.12.1
+torchvision==0.27.1
+
+# Modelling
+scikit-learn==1.9.0
+imbalanced-learn==0.14.2
+joblib==1.5.3
+
+# Data and plots
+numpy==2.5.0
+pandas==3.0.3
+matplotlib==3.11.0
+
+# Tests
+pytest==9.1.1

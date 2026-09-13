@@ -1,283 +1,232 @@
 # scripts/live_detect.py
-# Stage 5 - Live detection: YOLO + MediaPipe + trained classifier
-# Press Q to quit, S to save a snapshot
+# Stage 5 - live classroom engagement detection.
+#
+#   python scripts/live_detect.py                 # webcam
+#   python scripts/live_detect.py --source clip.mp4 --loop
+#   python scripts/live_detect.py --no-model      # heuristics only
+#
+# Keys:  Q quit   S snapshot   D debug HUD
+#
+# The work lives in the classsense package; this file is argument parsing, the
+# render loop, and keyboard handling.
+
+import argparse
+import os
+import sys
+import time
 
 import cv2
-import numpy as np
-import joblib
-import os
-import time
-import urllib.request
-from ultralytics import YOLO
-import mediapipe as mp
-from mediapipe.tasks import python as mp_python
-from mediapipe.tasks.python import vision as mp_vision
 
-# ── Paths ──────────────────────────────────────
-MODEL_PATH   = os.path.join("models", "engagement_classifier.pkl")
-SCALER_PATH  = os.path.join("models", "scaler.pkl")
-THRESH_PATH  = os.path.join("models", "threshold.pkl")
-MP_MODEL     = os.path.join("scripts", "face_landmarker.task")
-SNAPSHOT_DIR = os.path.join("data", "snapshots")
-# ───────────────────────────────────────────────
+# Run from anywhere: put the repo root on the path before importing the package.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-# ── Landmark indices ───────────────────────────
-LEFT_EYE   = [362, 385, 387, 263, 373, 380]
-RIGHT_EYE  = [33,  160, 158, 133, 153, 144]
-MOUTH      = [61, 291, 13, 14]
-NOSE_TIP   = 4
-FOREHEAD   = 10
-CHIN       = 152
-LEFT_FACE  = 234
-RIGHT_FACE = 454
+from classsense import config                                    # noqa: E402
+from classsense.pipeline import AnalysisWorker, FrameSource      # noqa: E402
+from classsense.render import (                                  # noqa: E402
+    draw_student, draw_dashboard, draw_banner, CROWDED_THRESHOLD,
+)
 
-# ── Colours ────────────────────────────────────
-GREEN  = (0, 220, 0)
-RED    = (0, 0, 220)
-YELLOW = (0, 220, 220)
-WHITE  = (255, 255, 255)
-BLACK  = (0, 0, 0)
-BLUE   = (220, 100, 0)
 
-# ── Helper functions ───────────────────────────
-def download_mp_model():
-    if not os.path.exists(MP_MODEL):
-        print("Downloading MediaPipe model...")
-        url = (
-            "https://storage.googleapis.com/mediapipe-models/"
-            "face_landmarker/face_landmarker/float16/1/face_landmarker.task"
+def load_model(allow_weak=False):
+    """
+    Load the classifier, or return None and carry on without it.
+
+    Deliberately non-fatal, and deliberately sceptical. The heuristic layer is
+    self-sufficient; a missing, stale, or near-chance model should quietly
+    degrade the system rather than stop it or quietly corrupt it.
+    """
+    import json
+    import joblib
+
+    paths = (config.MODEL_PATH, config.SCALER_PATH, config.THRESH_PATH)
+    if not all(os.path.exists(p) for p in paths):
+        print("No trained model found - running on heuristics only.", flush=True)
+        return None, None, 0.5
+
+    # Refuse a model that measured close to chance. A classifier at AUC ~0.59
+    # paints red boxes on attentive students often enough to cost the operator
+    # their trust in the colours the heuristics get right, and a monitor nobody
+    # believes is worse than one that says less.
+    meta = {}
+    if os.path.exists(config.META_PATH):
+        try:
+            with open(config.META_PATH, encoding="utf-8") as fh:
+                meta = json.load(fh)
+        except Exception:
+            meta = {}
+
+    if meta:
+        print(
+            f"Model card: {meta.get('oof_accuracy', '?')} accuracy vs "
+            f"{meta.get('majority_baseline', '?')} baseline, "
+            f"AUC {meta.get('oof_roc_auc', '?')}, "
+            f"{meta.get('n_subjects', '?')} subjects.",
+            flush=True,
         )
-        urllib.request.urlretrieve(url, MP_MODEL)
-        print("Done.")
-    else:
-        print("MediaPipe model found.")
 
-def eye_aspect_ratio(landmarks, eye_indices, w, h):
-    pts = [(landmarks[i].x * w, landmarks[i].y * h) for i in eye_indices]
-    v1  = np.linalg.norm(np.array(pts[1]) - np.array(pts[5]))
-    v2  = np.linalg.norm(np.array(pts[2]) - np.array(pts[4]))
-    h1  = np.linalg.norm(np.array(pts[0]) - np.array(pts[3]))
-    return round((v1 + v2) / (2.0 * h1 + 1e-6), 4)
+    if meta.get("advisory_only") and not allow_weak:
+        print(f"  -> {meta.get('advisory_reason', 'model is near chance')}.",
+              flush=True)
+        print("  -> Not used for decisions. Heuristics only. "
+              "Pass --use-weak-model to override.", flush=True)
+        return None, None, 0.5
 
-def mouth_aspect_ratio(landmarks, w, h):
-    top    = np.array([landmarks[MOUTH[2]].x * w, landmarks[MOUTH[2]].y * h])
-    bottom = np.array([landmarks[MOUTH[3]].x * w, landmarks[MOUTH[3]].y * h])
-    left   = np.array([landmarks[MOUTH[0]].x * w, landmarks[MOUTH[0]].y * h])
-    right  = np.array([landmarks[MOUTH[1]].x * w, landmarks[MOUTH[1]].y * h])
-    return round(
-        np.linalg.norm(top - bottom) / (np.linalg.norm(left - right) + 1e-6), 4
-    )
+    try:
+        classifier = joblib.load(config.MODEL_PATH)
+        scaler = joblib.load(config.SCALER_PATH)
+        threshold = float(joblib.load(config.THRESH_PATH))
+    except Exception as exc:
+        print(f"Could not load model ({exc}) - heuristics only.", flush=True)
+        return None, None, 0.5
 
-def head_pose_angles(landmarks, w, h):
-    nose          = landmarks[NOSE_TIP]
-    face_centre_x = (landmarks[LEFT_FACE].x + landmarks[RIGHT_FACE].x) / 2
-    face_centre_y = (landmarks[FOREHEAD].y  + landmarks[CHIN].y)        / 2
-    yaw   = round((nose.x - face_centre_x) * 100, 4)
-    pitch = round((nose.y - face_centre_y) * 100, 4)
-    return yaw, pitch
+    expected = len(config.FEATURE_COLS)
+    actual = getattr(scaler, "n_features_in_", expected)
+    if actual != expected:
+        # This is exactly the failure that made the previous model a constant
+        # predictor: a scaler fitted on a different feature set than the one
+        # being handed to it. Refuse it rather than feed it nonsense.
+        print(
+            f"Model expects {actual} features, pipeline produces {expected}. "
+            f"Refusing to use a mismatched model - retrain with "
+            f"scripts/train_model.py. Running on heuristics only.",
+            flush=True,
+        )
+        return None, None, 0.5
 
-def extract_features(landmarks, w, h):
-    left_ear   = eye_aspect_ratio(landmarks, LEFT_EYE,  w, h)
-    right_ear  = eye_aspect_ratio(landmarks, RIGHT_EYE, w, h)
-    avg_ear    = round((left_ear + right_ear) / 2, 4)
-    mar        = mouth_aspect_ratio(landmarks, w, h)
-    yaw, pitch = head_pose_angles(landmarks, w, h)
-    return np.array([[left_ear, right_ear, avg_ear, mar, yaw, pitch]])
+    print(f"Model loaded (threshold {threshold:.2f}).", flush=True)
+    return classifier, scaler, threshold
 
-def draw_label_box(frame, x1, y1, x2, y2, label, prob, color):
-    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-    text        = f"{label} {prob:.0%}"
-    (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
-    cv2.rectangle(frame, (x1, y1 - th - 10), (x1 + tw + 6, y1), color, -1)
-    cv2.putText(frame, text, (x1 + 3, y1 - 5),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.55, WHITE, 2)
 
-def draw_dashboard(frame, results, fps):
-    h, w        = frame.shape[:2]
-    total       = len(results)
-    attentive   = sum(1 for r in results if r[0] == "Attentive")
-    distracted  = total - attentive
-    engagement  = (attentive / total * 100) if total > 0 else 0
+def parse_args():
+    p = argparse.ArgumentParser(description="ClassSense AI live detection")
+    p.add_argument("--source", default=None,
+                   help="video file path; omit for the webcam")
+    p.add_argument("--camera", type=int, default=config.CAPTURE_INDEX,
+                   help="camera index (default 0)")
+    p.add_argument("--loop", action="store_true",
+                   help="loop a video file source")
+    p.add_argument("--no-model", action="store_true",
+                   help="skip the classifier, heuristics only")
+    p.add_argument("--use-weak-model", action="store_true",
+                   help="use the classifier even if it measured near chance")
+    p.add_argument("--pool", type=int, default=config.MP_POOL_SIZE,
+                   help=f"MediaPipe detectors (default {config.MP_POOL_SIZE})")
+    p.add_argument("--yolo-width", type=int, default=config.YOLO_INPUT_WIDTH,
+                   help=f"YOLO input width (default {config.YOLO_INPUT_WIDTH})")
+    p.add_argument("--max-per-cycle", type=int,
+                   default=config.MAX_STUDENTS_PER_CYCLE,
+                   help="students analysed per cycle before scheduling kicks in")
+    p.add_argument("--debug", action="store_true", help="start with the HUD on")
+    return p.parse_args()
 
-    # Semi-transparent background panel
-    panel_w, panel_h = 260, 160
-    px, py = w - panel_w - 10, 10
-    overlay = frame.copy()
-    cv2.rectangle(overlay, (px, py), (px + panel_w, py + panel_h), BLACK, -1)
-    cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
 
-    # Title
-    cv2.putText(frame, "ClassSense AI",
-                (px + 8, py + 24),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.65, BLUE, 2)
-
-    # Stats
-    cv2.putText(frame, f"Students   : {total}",
-                (px + 8, py + 52),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, WHITE, 1)
-    cv2.putText(frame, f"Attentive  : {attentive}",
-                (px + 8, py + 74),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, GREEN, 1)
-    cv2.putText(frame, f"Distracted : {distracted}",
-                (px + 8, py + 96),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, RED, 1)
-
-    # Engagement bar
-    bx, by = px + 8, py + 115
-    bw     = panel_w - 16
-    cv2.rectangle(frame, (bx, by), (bx + bw, by + 14), (50, 50, 50), -1)
-    fill      = int(bw * engagement / 100)
-    bar_color = GREEN if engagement >= 70 else YELLOW if engagement >= 40 else RED
-    if fill > 0:
-        cv2.rectangle(frame, (bx, by), (bx + fill, by + 14), bar_color, -1)
-    cv2.putText(frame, f"{engagement:.0f}% class engagement",
-                (bx, by + 32),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.42, WHITE, 1)
-
-    # FPS counter
-    cv2.putText(frame, f"FPS: {fps:.1f}",
-                (10, h - 10),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45, WHITE, 1)
-
-# ── Main ───────────────────────────────────────
 def main():
-    print("Starting ClassSense AI...", flush=True)
-    os.makedirs(SNAPSHOT_DIR, exist_ok=True)
-    os.makedirs("models", exist_ok=True)
+    args = parse_args()
 
-    download_mp_model()
+    print("=" * 60, flush=True)
+    print("ClassSense AI - live detection", flush=True)
+    print("Attentive (green) | Sleepy (orange) | Distracted (red) | "
+          "Unknown (gray)", flush=True)
+    print("=" * 60, flush=True)
 
-    # Load trained model
-    print("Loading trained model...", flush=True)
-    classifier = joblib.load(MODEL_PATH)
-    scaler     = joblib.load(SCALER_PATH)
-    threshold  = joblib.load(THRESH_PATH)
-    print(f"Model loaded. Threshold: {threshold:.2f}", flush=True)
+    os.makedirs(config.SNAPSHOT_DIR, exist_ok=True)
 
-    # Load YOLO
-    print("Loading YOLO...", flush=True)
-    yolo = YOLO("yolov8n.pt")
-    print("YOLO ready.", flush=True)
+    classifier, scaler, threshold = (None, None, 0.5)
+    if not args.no_model:
+        classifier, scaler, threshold = load_model(
+            allow_weak=args.use_weak_model
+        )
 
-    # Load MediaPipe
-    print("Loading MediaPipe...", flush=True)
-    base_options  = mp_python.BaseOptions(model_asset_path=MP_MODEL)
-    options       = mp_vision.FaceLandmarkerOptions(
-        base_options=base_options,
-        num_faces=10,
-        min_face_detection_confidence=0.2,
-        min_face_presence_confidence=0.2,
-        min_tracking_confidence=0.2,
-    )
-    face_detector = mp_vision.FaceLandmarker.create_from_options(options)
-    print("MediaPipe ready.", flush=True)
+    source_arg = args.source if args.source else args.camera
+    print(f"Opening source: {source_arg!r}", flush=True)
+    source = FrameSource(source_arg, loop=args.loop).start()
+    print(f"Source ready at {source.actual_size[0]}x{source.actual_size[1]}.",
+          flush=True)
 
-    # Open webcam
-    print("Opening camera...", flush=True)
-    cap = cv2.VideoCapture(0)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  1280)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+    worker = AnalysisWorker(
+        classifier=classifier,
+        scaler=scaler,
+        threshold=threshold,
+        pool_size=args.pool,
+        yolo_width=args.yolo_width,
+        max_per_cycle=args.max_per_cycle,
+    ).start(source)
 
-    if not cap.isOpened():
-        print("ERROR: Could not open camera.", flush=True)
-        return
+    print("\nQ quit   S snapshot   D debug HUD\n", flush=True)
 
-    print("Running. Press Q to quit, S to snapshot.\n", flush=True)
+    show_debug = args.debug
+    window = "ClassSense AI"
+    cv2.namedWindow(window, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(window, 1280, 720)
 
-    INFER_EVERY  = 5
-    frame_count  = 0
-    last_results = []
-    fps_timer    = time.time()
-    fps          = 0.0
+    fps_ema = None
+    last_t = time.time()
 
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            print("Camera read failed.")
-            break
+    try:
+        while source.running:
+            frame = source.read()
+            if frame is None:
+                break
 
-        frame_count += 1
-        now       = time.time()
-        fps       = 1.0 / (now - fps_timer + 1e-6)
-        fps_timer = now
+            now = time.time()
+            dt = now - last_t
+            last_t = now
+            inst = 1.0 / dt if dt > 0 else 0.0
+            fps_ema = inst if fps_ema is None else fps_ema * 0.9 + inst * 0.1
 
-        if frame_count % INFER_EVERY == 0:
-            h, w    = frame.shape[:2]
-            results = []
+            students, counts, tracked, readable = worker.snapshot()
+            crowded = len(students) > CROWDED_THRESHOLD
 
-            # Step 1 — YOLO: detect all persons
-            yolo_out = yolo(frame, classes=[0], verbose=False)[0]
+            for student in students:
+                draw_student(frame, student, crowded, show_debug)
 
-            for box in yolo_out.boxes:
-                x1, y1, x2, y2 = map(int, box.xyxy[0])
-                conf            = float(box.conf[0])
-                if conf < 0.25:
-                    continue
+            draw_dashboard(
+                frame, counts, fps_ema, worker.analysis_fps,
+                tracked, readable, show_debug, worker.cycle_ms,
+                worker.merged_total,
+            )
 
-                # Pad crop slightly for better face detection
-                pad  = 20
-                x1p  = max(0, x1 - pad)
-                y1p  = max(0, y1 - pad)
-                x2p  = min(w,  x2 + pad)
-                y2p  = min(h,  y2 + pad)
-                crop = frame[y1p:y2p, x1p:x2p]
-                if crop.size == 0:
-                    continue
+            if worker.cycles == 0:
+                draw_banner(frame, "Warming up - first analysis cycle running")
+            elif crowded:
+                draw_banner(
+                    frame,
+                    "Crowded view: only students needing attention are labelled",
+                )
 
-                # Step 2 — MediaPipe: landmarks on crop
-                crop_h, crop_w = crop.shape[:2]
-                rgb      = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
-                mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-                mp_res   = face_detector.detect(mp_image)
+            cv2.imshow(window, frame)
 
-                if not mp_res.face_landmarks:
-                    # Face not visible = looking away = distracted
-                    results.append(("Distracted", 0.85))
-                    draw_label_box(frame, x1, y1, x2, y2, "Distracted", 0.85, RED)
-                    continue
+            key = cv2.waitKey(1) & 0xFF
+            if key in (ord("q"), ord("Q"), 27):
+                break
+            if key in (ord("s"), ord("S")):
+                path = os.path.join(
+                    config.SNAPSHOT_DIR, f"snap_{int(time.time())}.jpg"
+                )
+                cv2.imwrite(path, frame)
+                print(f"Snapshot saved: {path}", flush=True)
+            if key in (ord("d"), ord("D")):
+                show_debug = not show_debug
+                print(f"HUD {'on' if show_debug else 'off'}", flush=True)
 
-                # Step 3 — Extract features
-                landmarks       = mp_res.face_landmarks[0]
-                features        = extract_features(landmarks, crop_w, crop_h)
+    except KeyboardInterrupt:
+        print("\nInterrupted.", flush=True)
+    finally:
+        worker.stop()
+        source.stop()
+        cv2.destroyAllWindows()
 
-                # Step 4 — Scale
-                features_scaled = scaler.transform(features)
+    if worker.cycles:
+        print(f"\n{worker.cycles} analysis cycles, "
+              f"{worker.cycle_ms:.0f}ms each "
+              f"({worker.analysis_fps:.1f}/s).", flush=True)
+    print("Stopped.", flush=True)
 
-                # Step 5 — Classify
-                proba      = classifier.predict_proba(features_scaled)[0]
-                dist_prob  = proba[0]
-                att_prob   = proba[1]
-                label      = "Distracted" if dist_prob >= threshold else "Attentive"
-                color      = RED if label == "Distracted" else GREEN
-                prob       = dist_prob if label == "Distracted" else att_prob
-
-                results.append((label, prob))
-                draw_label_box(frame, x1, y1, x2, y2, label, prob, color)
-
-            last_results = results
-
-        # Dashboard drawn every frame
-        draw_dashboard(frame, last_results, fps)
-        cv2.imshow("ClassSense AI - Live Detection", frame)
-
-        key = cv2.waitKey(1) & 0xFF
-        if key == ord("q"):
-            print("Quitting...")
-            break
-        elif key == ord("s"):
-            snap = os.path.join(SNAPSHOT_DIR, f"snap_{int(time.time())}.jpg")
-            cv2.imwrite(snap, frame)
-            print(f"Snapshot saved: {snap}")
-
-    cap.release()
-    cv2.destroyAllWindows()
-    print("Done.")
 
 if __name__ == "__main__":
     try:
         main()
-    except Exception as e:
+    except Exception:
         import traceback
-        print("CRASH:", e, flush=True)
         traceback.print_exc()
-        input("Press Enter to close...")
+        sys.exit(1)

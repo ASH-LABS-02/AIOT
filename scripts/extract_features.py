@@ -1,187 +1,224 @@
 # scripts/extract_features.py
-# Stage 3 - Feature extraction using NEW MediaPipe Tasks API
-# Compatible with mediapipe 0.10.30+
+# Stage 3 - turn DAiSEE clips into feature rows.
+#
+#   python scripts/extract_features.py
+#   python scripts/extract_features.py --split Train --workers 8
+#
+# Uses classsense.geometry, the same module the live pipeline uses. That is the
+# point: the previous version carried its own copy of the geometry functions,
+# the live path carried another, and the two drifted into different units -
+# which is how a model trained on raw normalised head pose ended up being fed
+# degrees at inference and became a constant predictor.
 
-import cv2
-import mediapipe as mp
-from mediapipe.tasks import python as mp_python
-from mediapipe.tasks.python import vision as mp_vision
-import pandas as pd
-import numpy as np
+import argparse
 import os
-import urllib.request
+import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-# ─────────────────────────────────────────────
-# CONFIGURE THESE PATHS TO MATCH YOUR SYSTEM
-# ─────────────────────────────────────────────
-DAISEE_ROOT  = r"C:\Users\AR\Downloads\DAiSEE\DAiSEE"
-SPLIT        = "Validation"
-LABELS_CSV   = os.path.join(DAISEE_ROOT, "Labels", f"{SPLIT}Labels.csv")
-DATASET_DIR  = os.path.join(DAISEE_ROOT, "DataSet", SPLIT)
-OUTPUT_CSV   = os.path.join("..", "data", f"{SPLIT.lower()}_features.csv")
-MODEL_PATH   = "face_landmarker.task"
-SAMPLE_EVERY = 15
-# ─────────────────────────────────────────────
+import cv2
+import numpy as np
+import pandas as pd
 
-# ── Download model if not already present ─────
-def download_model():
-    if not os.path.exists(MODEL_PATH):
-        print("Downloading MediaPipe face landmarker model (~30MB)...")
-        url = (
-            "https://storage.googleapis.com/mediapipe-models/"
-            "face_landmarker/face_landmarker/float16/1/face_landmarker.task"
-        )
-        urllib.request.urlretrieve(url, MODEL_PATH)
-        print("Model downloaded.")
-    else:
-        print("Model already present, skipping download.")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-# ── Landmark indices ───────────────────────────
-LEFT_EYE   = [362, 385, 387, 263, 373, 380]
-RIGHT_EYE  = [33,  160, 158, 133, 153, 144]
-MOUTH      = [61, 291, 13, 14]
-NOSE_TIP   = 4
-FOREHEAD   = 10
-CHIN       = 152
-LEFT_FACE  = 234
-RIGHT_FACE = 454
+from classsense import config                                    # noqa: E402
+from classsense.geometry import extract_feature_row              # noqa: E402
+from classsense.mp_pool import MediaPipePool, ensure_model       # noqa: E402
+import mediapipe as mp                                           # noqa: E402
 
-def eye_aspect_ratio(landmarks, eye_indices, w, h):
-    pts = [(landmarks[i].x * w, landmarks[i].y * h) for i in eye_indices]
-    v1  = np.linalg.norm(np.array(pts[1]) - np.array(pts[5]))
-    v2  = np.linalg.norm(np.array(pts[2]) - np.array(pts[4]))
-    h1  = np.linalg.norm(np.array(pts[0]) - np.array(pts[3]))
-    return round((v1 + v2) / (2.0 * h1 + 1e-6), 4)
 
-def mouth_aspect_ratio(landmarks, w, h):
-    top    = np.array([landmarks[MOUTH[2]].x * w, landmarks[MOUTH[2]].y * h])
-    bottom = np.array([landmarks[MOUTH[3]].x * w, landmarks[MOUTH[3]].y * h])
-    left   = np.array([landmarks[MOUTH[0]].x * w, landmarks[MOUTH[0]].y * h])
-    right  = np.array([landmarks[MOUTH[1]].x * w, landmarks[MOUTH[1]].y * h])
-    return round(
-        np.linalg.norm(top - bottom) / (np.linalg.norm(left - right) + 1e-6), 4
-    )
+def resolve_paths(split):
+    """
+    Locate the labels CSV and the video directory for a split.
 
-def head_pose_angles(landmarks, w, h):
-    nose         = landmarks[NOSE_TIP]
-    face_centre_x = (landmarks[LEFT_FACE].x + landmarks[RIGHT_FACE].x) / 2
-    face_centre_y = (landmarks[FOREHEAD].y  + landmarks[CHIN].y)        / 2
-    yaw   = round((nose.x - face_centre_x) * 100, 4)
-    pitch = round((nose.y - face_centre_y) * 100, 4)
-    return yaw, pitch
+    DAiSEE ships nested inconsistently and the two previous scripts disagreed
+    about it - check_paths.py resolved DataSet/DataSet/<split> while
+    extract_features.py resolved DataSet/<split>. Rather than hard-code either,
+    try the known layouts and report which one matched.
+    """
+    labels = os.path.join(config.DAISEE_ROOT, "Labels", f"{split}Labels.csv")
+    candidates = [
+        os.path.join(config.DAISEE_ROOT, "DataSet", split),
+        os.path.join(config.DAISEE_ROOT, "DataSet", "DataSet", split),
+        os.path.join(config.DAISEE_ROOT, split),
+    ]
+    videos = next((c for c in candidates if os.path.isdir(c)), None)
+    return labels, videos, candidates
 
-def label_to_binary(engagement_score):
-    return 1 if engagement_score >= 2 else 0
 
-def extract_features_from_video(video_path, detector):
+def clip_path(videos_dir, clip_id):
+    """DAiSEE nests as <person>/<clip stem>/<clip file>."""
+    stem = Path(clip_id).stem
+    return os.path.join(videos_dir, stem[:6], stem, clip_id)
+
+
+def features_for_clip(video_path, pool, sample_every):
+    """
+    Average the feature vector over sampled frames of one clip.
+
+    Averaging is what makes a clip-level label meaningful: DAiSEE labels the
+    whole 10-second clip, so a per-frame row would attach a clip-level
+    judgement to a single instant.
+    """
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
-        return []
+        return None
 
-    features_list = []
-    frame_idx     = 0
+    rows = []
+    idx = 0
+    try:
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            if idx % sample_every == 0:
+                h, w = frame.shape[:2]
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                image = mp.Image(image_format=mp.ImageFormat.SRGB,
+                                 data=np.ascontiguousarray(rgb))
+                landmarks = pool.detect(image)
+                if landmarks is not None:
+                    rows.append(extract_feature_row(landmarks, w, h))
+            idx += 1
+    finally:
+        cap.release()
 
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
+    if not rows:
+        return None
 
-        if frame_idx % SAMPLE_EVERY == 0:
-            h, w = frame.shape[:2]
-            rgb      = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-            result   = detector.detect(mp_image)
+    return {
+        col: round(float(np.mean([r[col] for r in rows])), 4)
+        for col in config.FEATURE_COLS
+    }, len(rows)
 
-            if result.face_landmarks:
-                lms       = result.face_landmarks[0]
-                left_ear  = eye_aspect_ratio(lms, LEFT_EYE,  w, h)
-                right_ear = eye_aspect_ratio(lms, RIGHT_EYE, w, h)
-                avg_ear   = round((left_ear + right_ear) / 2, 4)
-                mar       = mouth_aspect_ratio(lms, w, h)
-                yaw, pitch = head_pose_angles(lms, w, h)
 
-                features_list.append({
-                    "left_ear"  : left_ear,
-                    "right_ear" : right_ear,
-                    "avg_ear"   : avg_ear,
-                    "mar"       : mar,
-                    "yaw"       : yaw,
-                    "pitch"     : pitch,
-                })
-
-        frame_idx += 1
-
-    cap.release()
-    return features_list
-
-# ── Main ───────────────────────────────────────
 def main():
-    os.makedirs(os.path.join("..", "data"), exist_ok=True)
-    download_model()
+    p = argparse.ArgumentParser(description="Extract DAiSEE features")
+    p.add_argument("--split", default=config.DAISEE_SPLIT,
+                   help="Train / Validation / Test")
+    p.add_argument("--workers", type=int, default=config.MP_POOL_SIZE)
+    p.add_argument("--sample-every", type=int, default=config.SAMPLE_EVERY)
+    p.add_argument("--limit", type=int, default=None,
+                   help="stop after N clips (for a quick check)")
+    args = p.parse_args()
 
-    # Set up detector once, reuse across all videos (much faster)
-    base_options = mp_python.BaseOptions(model_asset_path=MODEL_PATH)
-    options      = mp_vision.FaceLandmarkerOptions(
-        base_options=base_options,
-        num_faces=1,
-        min_face_detection_confidence=0.5,
-        min_face_presence_confidence=0.5,
-        min_tracking_confidence=0.5,
-    )
-    detector = mp_vision.FaceLandmarker.create_from_options(options)
+    labels_csv, videos_dir, tried = resolve_paths(args.split)
 
-    print(f"Reading labels from: {LABELS_CSV}")
-    labels_df = pd.read_csv(LABELS_CSV)
-    print(f"Total clips: {len(labels_df)}")
+    print("=" * 60)
+    print(f"Extracting features - split {args.split}")
+    print("=" * 60)
 
-    all_rows  = []
-    processed = 0
-    skipped   = 0
+    if not os.path.exists(labels_csv):
+        print(f"ERROR: labels not found at {labels_csv}")
+        print(f"Set DAISEE_ROOT if the dataset lives elsewhere "
+              f"(currently {config.DAISEE_ROOT}).")
+        sys.exit(1)
 
+    if videos_dir is None:
+        print("ERROR: no video directory found. Tried:")
+        for c in tried:
+            print(f"  {c}")
+        print("\nOnly the Train split was downloaded in this checkout; "
+              "Validation and Test have labels but no videos.")
+        sys.exit(1)
+
+    print(f"labels : {labels_csv}")
+    print(f"videos : {videos_dir}")
+
+    ensure_model()
+    pool = MediaPipePool(args.workers, face_conf=config.MP_FACE_CONF_THRESH)
+
+    labels_df = pd.read_csv(labels_csv)
+    labels_df.columns = [c.strip() for c in labels_df.columns]
+    print(f"clips in labels: {len(labels_df)}\n")
+
+    tasks = []
     for _, row in labels_df.iterrows():
-        clip_id    = row["ClipID"]
-        engagement = row["Engagement"]
-        label      = label_to_binary(engagement)
+        clip_id = str(row["ClipID"]).strip()
+        path = clip_path(videos_dir, clip_id)
+        if os.path.exists(path):
+            tasks.append((clip_id, path, int(row["Engagement"])))
 
-        clip_name  = Path(clip_id).stem
-        person_id  = clip_name[:6]
-        video_path = os.path.join(DATASET_DIR, person_id, clip_name, clip_id)
+    print(f"clips present on disk: {len(tasks)} "
+          f"({len(labels_df) - len(tasks)} not downloaded)")
 
-        if not os.path.exists(video_path):
-            skipped += 1
-            continue
+    # Limit after filtering, and spread the sample across the dataset. Taking
+    # the head of the labels file would draw entirely from subjects near the
+    # start of the alphabet - and in this checkout the first several thousand
+    # rows belong to subjects that were never downloaded at all.
+    if args.limit and len(tasks) > args.limit:
+        stride = max(1, len(tasks) // args.limit)
+        tasks = tasks[::stride][:args.limit]
+        print(f"limited to {len(tasks)} clips, sampled every {stride}")
+    print()
+    if not tasks:
+        print("Nothing to extract.")
+        sys.exit(1)
 
-        frame_features = extract_features_from_video(video_path, detector)
+    results = []
+    no_face = []
+    done = 0
 
-        if not frame_features:
-            skipped += 1
-            continue
+    def work(task):
+        clip_id, path, engagement = task
+        out = features_for_clip(path, pool, args.sample_every)
+        return clip_id, engagement, out
 
-        avg_features = {
-            k: round(np.mean([f[k] for f in frame_features]), 4)
-            for k in frame_features[0].keys()
-        }
-        avg_features["label"]      = label
-        avg_features["clip_id"]    = clip_id
-        avg_features["engagement"] = engagement
-        all_rows.append(avg_features)
+    # Clips are independent and detect() releases the GIL, so this parallelises
+    # the same way the live pipeline does.
+    with ThreadPoolExecutor(max_workers=args.workers) as ex:
+        for clip_id, engagement, out in ex.map(work, tasks):
+            done += 1
+            if out is None:
+                no_face.append(clip_id)
+            else:
+                features, n_frames = out
+                features["clip_id"] = clip_id
+                features["person_id"] = clip_id[:6]
+                features["engagement"] = engagement
+                features["label"] = int(
+                    engagement >= config.ENGAGEMENT_POSITIVE_MIN
+                )
+                features["frames_used"] = n_frames
+                results.append(features)
+            if done % 100 == 0:
+                print(f"  {done}/{len(tasks)} clips...", flush=True)
 
-        processed += 1
-        if processed % 50 == 0:
-            print(f"  Processed {processed} clips...")
+    pool.close()
 
-    output_df = pd.DataFrame(all_rows)
-    output_df.to_csv(OUTPUT_CSV, index=False)
+    if not results:
+        print("No clips yielded a detectable face.")
+        sys.exit(1)
 
-    print(f"\nDone.")
-    print(f"  Processed : {processed} clips")
-    print(f"  Skipped   : {skipped} clips")
-    print(f"  Saved to  : {OUTPUT_CSV}")
-    print(f"\nLabel distribution:")
-    print(output_df["label"].value_counts())
-    print(f"\nSample output:")
-    print(output_df.head())
+    df = pd.DataFrame(results)
+    ordered = (config.FEATURE_COLS
+               + ["label", "engagement", "clip_id", "person_id", "frames_used"])
+    df = df[ordered]
+
+    os.makedirs(config.DATA_DIR, exist_ok=True)
+    out_csv = os.path.join(config.DATA_DIR, f"{args.split.lower()}_features.csv")
+    df.to_csv(out_csv, index=False)
+
+    print("\n" + "=" * 60)
+    print("Done")
+    print("=" * 60)
+    print(f"extracted : {len(df)} clips")
+    print(f"no face   : {len(no_face)} clips")
+    print(f"subjects  : {df['person_id'].nunique()}")
+    print(f"saved     : {out_csv}\n")
+
+    print(f"engagement 0-3:\n{df['engagement'].value_counts().sort_index().to_string()}")
+    print(f"\nbinary label (engagement >= {config.ENGAGEMENT_POSITIVE_MIN}):")
+    counts = df["label"].value_counts().sort_index()
+    for value, count in counts.items():
+        print(f"  {config.CLASS_NAMES[value]:<10} {count:>5}  "
+              f"({count / len(df) * 100:.1f}%)")
+
+    # Subject count bounds what any honest evaluation can claim, so say it here
+    # rather than let train_model.py imply more.
+    print(f"\nSubjects available for grouped CV: {df['person_id'].nunique()}")
+
 
 if __name__ == "__main__":
     main()
