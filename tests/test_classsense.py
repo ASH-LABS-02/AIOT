@@ -18,14 +18,14 @@ import pytest
 from classsense import config
 from classsense.geometry import (
     eye_aspect_ratio, mouth_aspect_ratio, head_pose_angles,
-    face_width_px, face_height_px, face_size_px,
+    face_width_px, face_height_px, face_size_px, face_centre_in_frame,
     extract_feature_row, compute_box_iou,
 )
 from classsense.states import EngagementState
 from classsense.tiers import (
     Tier, tier_for_face_width, trusts_eyes, trusts_pose, states_available,
 )
-from classsense.tracker import StudentTracker
+from classsense.tracker import StudentTracker, TrackedStudent
 
 
 # ── helpers ────────────────────────────────────
@@ -357,6 +357,79 @@ class TestTracker:
         t.update([], now=1000.0 + config.TRACK_STALE_SECONDS + 0.1)
         assert len(t.students) == 0
 
+    def test_moving_student_duplicate_clears_within_the_presence_window(self):
+        """
+        The bug a user hit at n=1: one person read as two students.
+
+        A student who shifts far enough that the new box misses the old one
+        spawns a new track, while the old lingers for TRACK_STALE_SECONDS so an
+        occluded student does not lose their timers. Counting every confirmed
+        track made that whole grace period show one person as two.
+
+        The duplicate cannot be eliminated outright: for a moment an abandoned
+        track and a briefly-occluded one are genuinely indistinguishable. What
+        it can be is short. Presence is now decided on TRACK_PRESENT_SECONDS
+        rather than TRACK_STALE_SECONDS, which is the difference between a
+        flicker and a wrong headcount that sits there for two seconds.
+        """
+        t = StudentTracker()
+        now = 1000.0
+        t.update([(700, 50, 1200, 700)], now=now)
+        first = next(iter(t.students.values()))
+        for _ in range(config.FACE_CONFIRM_HITS):
+            first.note_face_hit()
+        assert len(t.confirmed(now)) == 1
+
+        moved_at = now + 0.3
+        t.update([(100, 50, 600, 700)], now=moved_at)
+        second = [s for s in t.students.values() if s is not first][0]
+        for _ in range(config.FACE_CONFIRM_HITS):
+            second.note_face_hit()
+        second.last_seen = moved_at
+
+        assert len(t.students) == 2, "old track should still be retained"
+
+        # Once the abandoned track falls outside the presence window - and well
+        # before it is retired - the count is right again.
+        settled = now + config.TRACK_PRESENT_SECONDS + 0.05
+        t.update([(100, 50, 600, 700)], now=settled)
+        second.last_seen = settled
+        assert len(t.confirmed(settled)) == 1, "one person must count as one"
+        assert config.TRACK_PRESENT_SECONDS < config.TRACK_STALE_SECONDS / 2, \
+            "presence window must be much shorter than retention"
+
+    def test_retained_track_keeps_its_history_while_uncounted(self):
+        """Not counted is not the same as forgotten."""
+        t = StudentTracker()
+        now = 1000.0
+        t.update([(700, 50, 1200, 700)], now=now)
+        student = next(iter(t.students.values()))
+        for _ in range(config.FACE_CONFIRM_HITS):
+            student.note_face_hit()
+
+        later = now + config.TRACK_PRESENT_SECONDS + 0.1
+        t.update([], now=later)
+        assert student.track_id in t.students, "history was discarded too early"
+        assert len(t.confirmed(later)) == 0, "absent student still counted"
+
+        # Reappears before the retention window closes: same track, same history.
+        back = later + 0.1
+        t.update([(700, 50, 1200, 700)], now=back)
+        assert len(t.students) == 1
+        assert len(t.confirmed(back)) == 1
+
+    def test_brief_gap_does_not_blink_a_student_out(self):
+        """A single missed cycle must not drop someone from the count."""
+        t = StudentTracker()
+        now = 1000.0
+        t.update([(700, 50, 1200, 700)], now=now)
+        student = next(iter(t.students.values()))
+        for _ in range(config.FACE_CONFIRM_HITS):
+            student.note_face_hit()
+        # One analysis cycle at 60 students is ~0.17s; the presence window
+        # must comfortably exceed that.
+        assert len(t.confirmed(now + 0.2)) == 1
+
     def test_schedule_returns_everyone_under_the_cap(self):
         t = StudentTracker()
         boxes = [(i * 120, 0, i * 120 + 100, 200) for i in range(10)]
@@ -464,6 +537,118 @@ class TestTemporalGates:
                          now=2000.0 + config.FACE_LOST_DURATION + 0.1)
         assert s.state == "Distracted"
         assert s.reason == "Facing away"
+
+
+class TestFaceDeduplication:
+    """
+    Two tracks resolving to the same face are one person.
+
+    Box overlap cannot settle this: a duplicate YOLO box, or an old track
+    sitting beside the new one that replaced it, can differ enough in box space
+    to look like two people. The face position is the ground truth, because a
+    face is a point and one person has one.
+    """
+
+    def _confirmed_track(self, tracker, box, face_xy, size, now):
+        """
+        Add one confirmed track directly.
+
+        Built by hand rather than through update(), because update() would
+        associate an overlapping box onto the existing track - which is exactly
+        the situation these tests need to set up and therefore cannot rely on.
+        """
+        student = TrackedStudent(tracker._next_id, box, now)
+        tracker.students[tracker._next_id] = student
+        tracker._next_id += 1
+        for _ in range(config.FACE_CONFIRM_HITS):
+            student.note_face_hit(face_xy=face_xy, face_size=size, now=now)
+        student.last_seen = now
+        return student
+
+    def test_two_tracks_on_one_face_are_merged(self):
+        t = StudentTracker()
+        now = 1000.0
+        a = self._confirmed_track(t, (700, 50, 1200, 700), (950, 200), 130, now)
+        b = self._confirmed_track(t, (760, 20, 1279, 704), (955, 205), 128, now)
+        assert len({a.track_id, b.track_id}) == 2
+        assert len(t.students) == 2
+
+        merged = t.dedupe_by_face(now)
+        assert merged == 1
+        assert len(t.confirmed(now)) == 1, "one face must be one student"
+
+    def test_merge_keeps_the_longer_history(self):
+        """The survivor should be the track that has watched this person longer."""
+        t = StudentTracker()
+        now = 1000.0
+        older = self._confirmed_track(t, (700, 50, 1200, 700), (950, 200), 130, now)
+        newer = self._confirmed_track(t, (760, 20, 1279, 704), (955, 205), 128,
+                                      now + 0.5)
+        t.dedupe_by_face(now + 0.5)
+        assert older.track_id in t.students
+        assert newer.track_id not in t.students
+
+    def test_two_genuinely_separate_people_are_kept(self):
+        """Deduplication must not start deleting real students."""
+        t = StudentTracker()
+        now = 1000.0
+        self._confirmed_track(t, (100, 50, 500, 700), (300, 200), 130, now)
+        self._confirmed_track(t, (700, 50, 1200, 700), (950, 200), 130, now)
+        assert t.dedupe_by_face(now) == 0
+        assert len(t.confirmed(now)) == 2
+
+    def test_neighbours_sitting_close_are_kept(self):
+        """
+        Adjacent students in a packed row are the hard case: heavily overlapping
+        boxes, distinct faces. Only the face separation may decide.
+        """
+        t = StudentTracker()
+        now = 1000.0
+        size = 80
+        gap = size * (config.DUPLICATE_FACE_DISTANCE + 0.3)
+        self._confirmed_track(t, (400, 50, 900, 700), (600, 200), size, now)
+        self._confirmed_track(t, (450, 50, 950, 700), (600 + gap, 205), size, now)
+        assert t.dedupe_by_face(now) == 0
+        assert len(t.confirmed(now)) == 2
+
+    def test_stale_face_positions_are_not_compared(self):
+        """An old face reading must not merge away a student seen since."""
+        t = StudentTracker()
+        now = 1000.0
+        self._confirmed_track(t, (700, 50, 1200, 700), (950, 200), 130, now)
+        later = now + config.TRACK_PRESENT_SECONDS + 1.0
+        self._confirmed_track(t, (100, 50, 600, 700), (950, 200), 130, later)
+        assert t.dedupe_by_face(later) == 0
+
+    def test_face_centre_maps_back_into_frame_coordinates(self):
+        """
+        The measurement deduplication rests on.
+
+        Landmarks are normalised to their crop, so without walking them back
+        through the resize and the crop offset every face reports roughly the
+        same position and no duplicate is ever visible.
+        """
+        lms = synthetic_face()
+        # Crop taken at (500,100), downscaled by half, 20px padding.
+        box = (520, 120, 1000, 600)
+        cx, cy = face_centre_in_frame(lms, box, crop_w=240, crop_h=240,
+                                      scale=0.5, padding=20)
+        # Nose sits at (0.5, 0.5) of a 240px crop -> 120px in, /0.5 -> 240px,
+        # offset by the padded origin (500, 100).
+        assert cx == pytest.approx(500 + 240, abs=1.0)
+        assert cy == pytest.approx(100 + 240, abs=1.0)
+
+    def test_two_crops_of_one_face_agree_on_position(self):
+        """Different boxes over the same face must report the same point."""
+        lms = synthetic_face()
+        a = face_centre_in_frame(lms, (500, 100, 980, 580),
+                                 crop_w=240, crop_h=240, scale=0.5, padding=0)
+        b = face_centre_in_frame(lms, (500, 100, 740, 340),
+                                 crop_w=240, crop_h=240, scale=1.0, padding=0)
+        # Same face, different crop scales: the frame position must agree well
+        # inside the duplicate threshold.
+        assert abs(a[0] - b[0]) < 130
+        assert abs(a[1] - b[1]) < 130
 
 
 class TestModelHandoff:

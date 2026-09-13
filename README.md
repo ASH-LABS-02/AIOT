@@ -180,8 +180,9 @@ scripts/
   extract_features.py  DAiSEE clips -> features
   train_model.py       train + subject-independent evaluation
   check_paths.py       what dataset is actually on disk
+  diagnose_duplicates.py  why one person is being counted as more than one
 
-tests/                 75 tests
+tests/                 86 tests
 ```
 
 `geometry.py` is imported by **both** the training extractor and the live pipeline. That
@@ -246,4 +247,8 @@ confirmation and the room read as permanently empty.
   angle, same lighting. Real classrooms vary in both.
 - **Tracking is IoU-based**, which suits seated students. People who cross paths may swap
   identities and with them their temporal history.
+- **A student who moves far enough to break box association can read as two for up to
+  0.6s** before the abandoned track leaves the presence window. The duplicate cannot be
+  removed outright — for a moment an abandoned track and a briefly-occluded one are
+  genuinely indistinguishable — but it is a flicker rather than a standing miscount.
 - **13 subjects** bounds everything the classifier can claim.

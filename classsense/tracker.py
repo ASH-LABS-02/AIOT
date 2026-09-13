@@ -6,12 +6,13 @@
 # it is the same pair of eyes. Association is greedy IoU, which is enough for
 # seated students: they occupy stable positions and rarely swap places.
 
+import math
 import time
 
 from classsense.config import (
     TRACK_IOU_MATCH, TRACK_STALE_SECONDS, TRACK_UNCONFIRMED_TTL,
-    UNCONFIRMED_MAX_ATTEMPTS, FACE_CONFIRM_HITS,
-    STABLE_AFTER_SECONDS, STABLE_PRIORITY_PENALTY,
+    UNCONFIRMED_MAX_ATTEMPTS, FACE_CONFIRM_HITS, TRACK_PRESENT_SECONDS,
+    DUPLICATE_FACE_DISTANCE, STABLE_AFTER_SECONDS, STABLE_PRIORITY_PENALTY,
 )
 from classsense.geometry import compute_box_iou
 from classsense.states import EngagementState
@@ -38,6 +39,14 @@ class TrackedStudent:
         # than seconds, so a slow machine cannot starve confirmation.
         self.analysis_count = 0
 
+        # Where this student's face last landed in frame coordinates, and how
+        # big it was. Two tracks reporting the same face position are one
+        # person - the only reliable way to catch that, since their boxes may
+        # legitimately differ.
+        self.face_xy = None
+        self.face_size = 0.0
+        self.face_seen_at = 0.0
+
         self.engagement = EngagementState()
 
     @property
@@ -52,10 +61,27 @@ class TrackedStudent:
     def tier(self):
         return self.engagement.tier
 
-    def note_face_hit(self):
+    def note_face_hit(self, face_xy=None, face_size=0.0, now=None):
         self.face_hit_count += 1
         if self.face_hit_count >= FACE_CONFIRM_HITS:
             self.face_confirmed = True
+        if face_xy is not None:
+            self.face_xy = face_xy
+            self.face_size = face_size
+            self.face_seen_at = now or time.time()
+
+    def is_present(self, now=None):
+        """
+        Seen recently enough to count as in the room.
+
+        Distinct from being retained. A track keeps its history for
+        TRACK_STALE_SECONDS so a brief occlusion does not reset a student's
+        timers, but it stops being counted as soon as it stops being seen -
+        otherwise a student who shifts seats is two students until the old
+        track expires.
+        """
+        now = now or time.time()
+        return (now - self.last_seen) <= TRACK_PRESENT_SECONDS
 
     def priority(self, now=None):
         """
@@ -157,9 +183,67 @@ class StudentTracker:
         for sid in stale:
             del self.students[sid]
 
-    def confirmed(self):
-        """Only the tracks that have proven they are people."""
-        return {sid: s for sid, s in self.students.items() if s.face_confirmed}
+    def confirmed(self, now=None):
+        """
+        The students actually in the room: face-confirmed and seen recently.
+
+        Both conditions matter. Confirmation keeps furniture out; recency keeps
+        ghosts out - a track that has been abandoned but not yet retired is
+        still holding a student's history and must not also be holding a place
+        in the headcount.
+        """
+        now = now or time.time()
+        return {
+            sid: s for sid, s in self.students.items()
+            if s.face_confirmed and s.is_present(now)
+        }
+
+    def dedupe_by_face(self, now=None):
+        """
+        Merge tracks that resolved to the same face. Returns how many went.
+
+        Two boxes over one person - a duplicate YOLO detection, or an old track
+        that has not yet expired next to the new one that replaced it - will
+        each crop a region containing that person, each detect the same face,
+        and each keep confirming. Nothing in box space distinguishes that from
+        two people standing close together; the faces do, because they land on
+        the same point.
+
+        The survivor is the track with the longer history, so a student keeps
+        the timers they have accumulated rather than restarting them.
+        """
+        now = now or time.time()
+        recent = [
+            s for s in self.students.values()
+            if s.face_xy is not None
+            and (now - s.face_seen_at) <= TRACK_PRESENT_SECONDS
+        ]
+
+        merged = set()
+        for i, a in enumerate(recent):
+            if a.track_id in merged:
+                continue
+            for b in recent[i + 1:]:
+                if b.track_id in merged:
+                    continue
+
+                reference = max(a.face_size, b.face_size)
+                if reference <= 0:
+                    continue
+                dx = a.face_xy[0] - b.face_xy[0]
+                dy = a.face_xy[1] - b.face_xy[1]
+                if math.hypot(dx, dy) > reference * DUPLICATE_FACE_DISTANCE:
+                    continue
+
+                # Same face. Keep whichever has watched this person longer.
+                keeper, loser = (a, b) if a.created_at <= b.created_at else (b, a)
+                merged.add(loser.track_id)
+                keeper.last_seen = max(keeper.last_seen, loser.last_seen)
+                keeper.face_hit_count += loser.face_hit_count
+
+        for track_id in merged:
+            self.students.pop(track_id, None)
+        return len(merged)
 
     def schedule(self, limit, now=None):
         """
@@ -177,9 +261,10 @@ class StudentTracker:
         students.sort(key=lambda s: s.priority(now), reverse=True)
         return students[:limit]
 
-    def counts(self):
-        """Tally of confirmed students by state, for the dashboard."""
+    def counts(self, now=None):
+        """Tally of present students by state, for the dashboard."""
+        now = now or time.time()
         tally = {"Attentive": 0, "Sleepy": 0, "Distracted": 0, "Unknown": 0}
-        for student in self.confirmed().values():
+        for student in self.confirmed(now).values():
             tally[student.state] = tally.get(student.state, 0) + 1
         return tally

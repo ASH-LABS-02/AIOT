@@ -103,6 +103,29 @@ TRACK_STALE_SECONDS  = 2.0    # drop a track unseen this long
 TRACK_UNCONFIRMED_TTL = 1.0   # earliest a never-confirmed box may be dropped
 FACE_CONFIRM_HITS    = 2      # landmark hits before a box counts as a student
 
+# How recently a track must have been seen to be COUNTED as present.
+#
+# Retention and presence are different questions and were previously the same
+# number, which is what let one person read as two. TRACK_STALE_SECONDS keeps
+# an unmatched track alive so a student briefly occluded by someone walking
+# past does not lose their eye-closure timer. But during that grace the
+# abandoned track was still being counted and drawn - so a student who simply
+# shifted seats appeared twice for two full seconds.
+#
+# A track is now retained for TRACK_STALE_SECONDS but only counted for
+# TRACK_PRESENT_SECONDS. Keep this comfortably above one analysis cycle
+# (~0.17s at 60 students) so an ordinary cycle gap never blinks someone out.
+TRACK_PRESENT_SECONDS = 0.6
+
+# Two tracks whose faces land within this many face-widths of each other in
+# frame coordinates are the same person, and the younger is merged away.
+#
+# Box overlap cannot catch this on its own: two boxes can differ enough to look
+# like two people by any box-shaped measure while resolving to one face. A face
+# is a point, so comparing face positions settles it. This is the check that
+# has to hold for the headcount to mean anything in a full room.
+DUPLICATE_FACE_DISTANCE = 0.6
+
 # Chances an unconfirmed box gets before it is written off as furniture.
 # Retirement needs BOTH this many analysis attempts AND the wall-clock TTL,
 # never either alone. A wall clock on its own is a trap: confirmation takes

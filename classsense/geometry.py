@@ -123,6 +123,26 @@ def face_size_px(landmarks, w, h):
     return max(width, from_height)
 
 
+def face_centre_in_frame(landmarks, box, crop_w, crop_h, scale, padding):
+    """
+    Where this face sits in the original frame, in pixels.
+
+    Landmarks are normalised to their crop, so comparing two students' faces
+    means walking each back through its crop's resize and its offset within the
+    frame. Without this, every face reports a position near (0.5, 0.4) of its
+    own crop and they all look identical.
+
+    This is what makes duplicate students detectable: two tracks can hold quite
+    different boxes and still be one person, and only the face position says so.
+    """
+    nose = landmarks[NOSE_TIP]
+    inv = 1.0 / max(scale, EPS)
+    x0 = max(0, box[0] - padding)
+    y0 = max(0, box[1] - padding)
+    return (x0 + nose.x * crop_w * inv,
+            y0 + nose.y * crop_h * inv)
+
+
 def extract_feature_row(landmarks, w, h):
     """
     The full feature vector, in config.FEATURE_COLS order.

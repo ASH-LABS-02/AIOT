@@ -183,6 +183,7 @@ def main():
             draw_dashboard(
                 frame, counts, fps_ema, worker.analysis_fps,
                 tracked, readable, show_debug, worker.cycle_ms,
+                worker.merged_total,
             )
 
             if worker.cycles == 0:

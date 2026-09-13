@@ -92,7 +92,7 @@ def _draw_telemetry(frame, student, x1, y1):
 
 
 def draw_dashboard(frame, counts, fps, analysis_fps, tracked, readable,
-                   show_debug, cycle_ms=0.0):
+                   show_debug, cycle_ms=0.0, merged=0):
     """Summary panel. At 60 students this, not the boxes, is what gets read."""
     h, w = frame.shape[:2]
     total = sum(counts.values())
@@ -142,7 +142,12 @@ def draw_dashboard(frame, counts, fps, analysis_fps, tracked, readable,
     perf = f"display {fps:.0f}fps  analysis {analysis_fps:.1f}/s"
     cv2.putText(frame, perf, (px + 12, by + 52), FONT, 0.38, WHITE, 1)
     if show_debug and cycle_ms:
-        cv2.putText(frame, f"cycle {cycle_ms:.0f}ms  tracked {tracked}",
+        # `tracked` counts retained tracks, `Students` above counts present
+        # ones. A gap between them is normal and brief - it means someone
+        # moved and their old track has not expired yet. A persistent gap, or
+        # any nonzero merge count, is the duplicate-student problem showing.
+        cv2.putText(frame, f"cycle {cycle_ms:.0f}ms  tracks {tracked}"
+                            f"  merged {merged}",
                     (px + 12, by + 70), FONT, 0.38, YELLOW, 1)
 
     hud = "[D] HUD on" if show_debug else "[D] HUD off"

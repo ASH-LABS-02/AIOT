@@ -28,7 +28,9 @@ from classsense.config import (
     MAX_STUDENTS_PER_CYCLE, CROP_PADDING, CAPTURE_WIDTH, CAPTURE_HEIGHT,
     CAPTURE_INDEX, YOLO_WEIGHTS, DETECT_EVERY,
 )
-from classsense.geometry import extract_feature_row, face_size_px
+from classsense.geometry import (
+    extract_feature_row, face_size_px, face_centre_in_frame,
+)
 from classsense.mp_pool import MediaPipePool, prepare_crop
 from classsense.tiers import tier_for_face_width, Tier
 from classsense.tracker import StudentTracker
@@ -136,6 +138,8 @@ class AnalysisWorker:
         self.cycle_ms = 0.0
         self.analysis_fps = 0.0
         self.cycles = 0
+        self.merged_last_cycle = 0
+        self.merged_total = 0
         self._stop = threading.Event()
         self._thread = None
 
@@ -225,18 +229,29 @@ class AnalysisWorker:
                     continue
 
                 landmarks, cw, ch, scale = outcome
-                student.note_face_hit()
-                # A student with a visible face is present, whether or not YOLO
-                # ran this cycle. Without this, tracks would age toward
-                # retirement through every skipped detection pass.
-                student.last_seen = now
                 # Undo the crop downscale before tiering. The tier has to
                 # describe how many pixels the camera actually put on this
                 # face, not how many survived prepare_crop's 192px cap.
                 size = face_size_px(landmarks, cw, ch) / max(scale, 1e-6)
+                centre = face_centre_in_frame(
+                    landmarks, student.box, cw, ch, scale, CROP_PADDING
+                )
+                student.note_face_hit(face_xy=centre, face_size=size, now=now)
+                # A student with a visible face is present, whether or not YOLO
+                # ran this cycle. Without this, tracks would age toward
+                # retirement through every skipped detection pass.
+                student.last_seen = now
+
                 tier = tier_for_face_width(size)
                 features = extract_feature_row(landmarks, cw, ch)
                 student.engagement.update(features, tier, now=now)
+
+            # Now that every face position for this cycle is known, collapse
+            # any tracks that turned out to be the same person. Must run here,
+            # after the landmark pass, because it is the face positions - not
+            # the boxes - that reveal a duplicate.
+            self.merged_last_cycle = self.tracker.dedupe_by_face(now)
+            self.merged_total += self.merged_last_cycle
 
         # Outside the lock on purpose. A batched predict over 60 students costs
         # ~56ms, and the render thread calls snapshot() every frame (~33ms at
@@ -314,9 +329,10 @@ class AnalysisWorker:
 
     def snapshot(self):
         """Copy of what the render thread needs, taken under the lock."""
+        now = time.time()
         with self.lock:
-            confirmed = list(self.tracker.confirmed().values())
-            counts = self.tracker.counts()
+            confirmed = list(self.tracker.confirmed(now).values())
+            counts = self.tracker.counts(now)
             tracked = len(self.tracker.students)
         readable = sum(1 for s in confirmed if s.tier >= Tier.COARSE)
         return confirmed, counts, tracked, readable
