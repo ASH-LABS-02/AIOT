@@ -18,7 +18,8 @@ import pytest
 from classsense import config
 from classsense.geometry import (
     eye_aspect_ratio, mouth_aspect_ratio, head_pose_angles,
-    face_width_px, extract_feature_row, compute_box_iou,
+    face_width_px, face_height_px, face_size_px,
+    extract_feature_row, compute_box_iou,
 )
 from classsense.states import EngagementState
 from classsense.tiers import (
@@ -148,6 +149,68 @@ class TestGeometryDirections:
         lms = synthetic_face()
         assert face_width_px(lms, 100) == pytest.approx(40.0, abs=0.5)
         assert face_width_px(lms, 500) == pytest.approx(200.0, abs=0.5)
+
+
+def turned_face(cos_yaw):
+    """
+    A face foreshortened by a head turn.
+
+    Cheek-to-cheek width projects as cos(yaw) while face height does not, so
+    narrowing only the cheek landmarks reproduces what a turned head does to
+    the landmark set.
+    """
+    lms = synthetic_face()
+    centre = 0.5
+    half = 0.20 * cos_yaw
+    lms[config.LEFT_FACE] = _lm(centre - half, 0.50)
+    lms[config.RIGHT_FACE] = _lm(centre + half, 0.50)
+    return lms
+
+
+class TestYawRobustFaceSize:
+    """
+    Tier must not collapse just because a student turned their head.
+
+    Sizing on cheek width alone demotes a turning student out of the tier that
+    permits Sleepy detection - at exactly the moment they are most worth
+    watching. face_size_px falls back to the yaw-invariant height estimate.
+    """
+
+    def test_frontal_face_size_is_at_least_its_width(self):
+        lms = synthetic_face()
+        assert face_size_px(lms, 200, 200) >= face_width_px(lms, 200)
+
+    def test_height_is_unaffected_by_yaw(self):
+        """The property the fallback rests on."""
+        tall = face_height_px(turned_face(1.0), 200)
+        turned = face_height_px(turned_face(0.6), 200)
+        assert turned == pytest.approx(tall, abs=1e-6)
+
+    @pytest.mark.parametrize("cos_yaw", [1.0, 0.87, 0.77, 0.71, 0.6])
+    def test_size_is_stable_as_the_head_turns(self, cos_yaw):
+        frontal = face_size_px(turned_face(1.0), 200, 200)
+        turned = face_size_px(turned_face(cos_yaw), 200, 200)
+        assert turned == pytest.approx(frontal, rel=0.02)
+
+    def test_raw_width_would_have_collapsed(self):
+        """The failure mode this guards against, stated explicitly."""
+        frontal = face_width_px(turned_face(1.0), 200)
+        turned = face_width_px(turned_face(0.71), 200)
+        assert turned < frontal * 0.8
+
+    def test_turned_face_keeps_its_tier(self):
+        w = h = 200
+        frontal_tier = tier_for_face_width(face_size_px(turned_face(1.0), w, h))
+        turned_tier = tier_for_face_width(face_size_px(turned_face(0.71), w, h))
+        assert frontal_tier == Tier.FULL
+        assert turned_tier == Tier.FULL
+
+    def test_genuinely_small_faces_are_still_demoted(self):
+        """Robustness to yaw must not become blindness to distance."""
+        lms = synthetic_face()
+        # A tiny crop: every landmark distance scales down with it.
+        assert tier_for_face_width(face_size_px(lms, 60, 60)) < Tier.FULL
+        assert tier_for_face_width(face_size_px(lms, 30, 30)) == Tier.PRESENCE
 
 
 class TestIoU:

@@ -15,6 +15,7 @@ import numpy as np
 from classsense.config import (
     LEFT_EYE, RIGHT_EYE, MOUTH, NOSE_TIP, FOREHEAD, CHIN,
     LEFT_FACE, RIGHT_FACE, LEFT_EYE_OUTER, RIGHT_EYE_OUTER,
+    FACE_WIDTH_TO_HEIGHT,
 )
 
 EPS = 1e-6
@@ -88,15 +89,38 @@ def head_pose_angles(landmarks, w, h):
 
 
 def face_width_px(landmarks, w):
+    """Raw cheek-to-cheek width in pixels. Foreshortens as the head turns."""
+    return float(abs(landmarks[RIGHT_FACE].x - landmarks[LEFT_FACE].x) * w)
+
+
+def face_height_px(landmarks, h):
+    """Forehead-to-chin height in pixels. Unaffected by yaw."""
+    return float(abs(landmarks[CHIN].y - landmarks[FOREHEAD].y) * h)
+
+
+def face_size_px(landmarks, w, h):
     """
-    Width of the face in pixels, cheek to cheek.
+    How many pixels we have on this face, robust to head turn.
 
     This is what assigns a resolution tier, so it is measured on the face
     itself rather than inferred from the YOLO person box - a person box
     includes torso and varies with posture, and would mis-tier a student who
     leans forward.
+
+    Cheek width alone is the obvious measure and the wrong one: it projects as
+    cos(yaw), so a student turning 40 degrees loses about a quarter of their
+    apparent width and drops a tier - losing Sleepy detection at the moment
+    they are most worth watching. Face height does not foreshorten with yaw, so
+    scaling it by the measured 0.887 width-to-height ratio gives a second
+    estimate that survives the turn.
+
+    Taking the larger of the two means a frontal face uses whichever is
+    cleaner, and a turned face keeps the height-derived estimate rather than
+    being demoted for turning.
     """
-    return float(abs(landmarks[RIGHT_FACE].x - landmarks[LEFT_FACE].x) * w)
+    width = face_width_px(landmarks, w)
+    from_height = face_height_px(landmarks, h) * FACE_WIDTH_TO_HEIGHT
+    return max(width, from_height)
 
 
 def extract_feature_row(landmarks, w, h):

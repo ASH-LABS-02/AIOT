@@ -26,9 +26,9 @@ import numpy as np
 from classsense.config import (
     YOLO_CONF_THRESH, YOLO_INPUT_WIDTH, MP_POOL_SIZE, MP_FACE_CONF_THRESH,
     MAX_STUDENTS_PER_CYCLE, CROP_PADDING, CAPTURE_WIDTH, CAPTURE_HEIGHT,
-    CAPTURE_INDEX, YOLO_WEIGHTS,
+    CAPTURE_INDEX, YOLO_WEIGHTS, DETECT_EVERY,
 )
-from classsense.geometry import extract_feature_row, face_width_px
+from classsense.geometry import extract_feature_row, face_size_px
 from classsense.mp_pool import MediaPipePool, prepare_crop
 from classsense.tiers import tier_for_face_width, Tier
 from classsense.tracker import StudentTracker
@@ -114,7 +114,8 @@ class AnalysisWorker:
 
     def __init__(self, classifier=None, scaler=None, threshold=0.5,
                  pool_size=MP_POOL_SIZE, yolo_width=YOLO_INPUT_WIDTH,
-                 max_per_cycle=MAX_STUDENTS_PER_CYCLE):
+                 max_per_cycle=MAX_STUDENTS_PER_CYCLE,
+                 detect_every=DETECT_EVERY):
         from ultralytics import YOLO
 
         self.yolo = YOLO(YOLO_WEIGHTS)
@@ -126,6 +127,8 @@ class AnalysisWorker:
         self.threshold = threshold
         self.yolo_width = yolo_width
         self.max_per_cycle = max_per_cycle
+        self.detect_every = max(1, detect_every)
+        self._since_detect = 0          # 0 means "detect on the next cycle"
 
         self.tracker = StudentTracker()
         self.lock = threading.Lock()
@@ -162,71 +165,100 @@ class AnalysisWorker:
             self.cycles += 1
 
     def analyse(self, frame):
-        """One full analysis cycle over the given frame."""
+        """
+        One full analysis cycle over the given frame.
+
+        Person detection runs every DETECT_EVERY cycles; landmark analysis runs
+        every cycle. Seated students do not move much between passes, and YOLO
+        measured 47% of a 60-student cycle spent re-finding them, while the
+        signals that actually change are all read from landmarks.
+        """
         now = time.time()
-        boxes = self.detect_people(frame)
+
+        run_detect = (self._since_detect <= 0)
+        if run_detect:
+            boxes = self.detect_people(frame)
+            self._since_detect = self.detect_every - 1
+        else:
+            self._since_detect -= 1
 
         with self.lock:
-            self.tracker.update(boxes, now)
+            if run_detect:
+                self.tracker.update(boxes, now)
             batch = self.tracker.schedule(self.max_per_cycle, now)
 
         # Landmark extraction, fanned across the pool. This is the parallel
         # section and the reason 60 students fit in a cycle: detect() releases
         # the GIL, measured at 3.21x over 8 threads.
-        jobs = []
-        for student in batch:
-            prepared = prepare_crop(frame, student.box, CROP_PADDING)
-            if prepared is None:
-                jobs.append((student, None))
-                continue
-            jobs.append((student, prepared))
-
-        futures = {}
-        for student, prepared in jobs:
-            if prepared is None:
-                continue
-            image, cw, ch, scale = prepared
-            futures[self.executor.submit(self.pool.detect, image)] = (
-                student, cw, ch, scale
-            )
+        #
+        # Cropping rides along inside the workers rather than running serially
+        # first. cv2's resize and colour conversion also drop the GIL, so the
+        # ~22ms of crop preparation parallelises for free - and one task per
+        # student is simpler than staging the work in two passes.
+        futures = {
+            self.executor.submit(self._crop_and_detect, frame, student.box):
+                student
+            for student in batch
+        }
 
         results = []
-        for future, (student, cw, ch, scale) in futures.items():
+        for future, student in futures.items():
             try:
-                landmarks = future.result()
+                outcome = future.result()
             except Exception:
-                landmarks = None
-            results.append((student, landmarks, cw, ch, scale))
+                outcome = None
+            results.append((student, outcome))
 
         # Short critical section: only the state mutation is serialised.
         with self.lock:
-            for student, landmarks, cw, ch, scale in results:
+            for student, outcome in results:
                 student.last_analysed = now
-                if landmarks is None:
+                student.analysis_count += 1
+
+                # outcome is None when the crop was degenerate; its landmarks
+                # are None when the crop was fine but held no detectable face.
+                # Both mean "no reading this cycle", and both must still count
+                # as an attempt or the student's priority stays pinned high and
+                # crowds everyone else out of the schedule.
+                if outcome is None or outcome[0] is None:
                     student.engagement.mark_face_lost(student.face_confirmed, now)
                     continue
 
+                landmarks, cw, ch, scale = outcome
                 student.note_face_hit()
+                # A student with a visible face is present, whether or not YOLO
+                # ran this cycle. Without this, tracks would age toward
+                # retirement through every skipped detection pass.
+                student.last_seen = now
                 # Undo the crop downscale before tiering. The tier has to
                 # describe how many pixels the camera actually put on this
                 # face, not how many survived prepare_crop's 192px cap.
-                width = face_width_px(landmarks, cw) / max(scale, 1e-6)
-                tier = tier_for_face_width(width)
+                size = face_size_px(landmarks, cw, ch) / max(scale, 1e-6)
+                tier = tier_for_face_width(size)
                 features = extract_feature_row(landmarks, cw, ch)
                 student.engagement.update(features, tier, now=now)
 
-            # Students whose crop was degenerate never reached the pool. Mark
-            # them analysed anyway, or their priority stays pinned high and
-            # they crowd everyone else out of the schedule.
-            for student, prepared in jobs:
-                if prepared is None:
-                    student.last_analysed = now
-                    student.engagement.mark_face_lost(student.face_confirmed, now)
+        # Outside the lock on purpose. A batched predict over 60 students costs
+        # ~56ms, and the render thread calls snapshot() every frame (~33ms at
+        # 30fps) - holding the lock across the forest would stall drawing for
+        # nearly two frames every cycle. apply_model only touches per-student
+        # state the render thread reads atomically, so the brief inconsistency
+        # is a student still showing last cycle's label, which is exactly what
+        # every student between cycles is already showing.
+        self._apply_model(batch)
 
-            for student in batch:
-                student.analysis_count += 1
+    def _crop_and_detect(self, frame, box):
+        """
+        One student's whole landmark pass, to be run on a worker thread.
 
-            self._apply_model(batch)
+        Returns (landmarks, crop_w, crop_h, scale), with landmarks None when no
+        face was found, or None outright when the box yielded no usable crop.
+        """
+        prepared = prepare_crop(frame, box, CROP_PADDING)
+        if prepared is None:
+            return None
+        image, cw, ch, scale = prepared
+        return self.pool.detect(image), cw, ch, scale
 
     def _apply_model(self, batch):
         """
@@ -238,7 +270,7 @@ class AnalysisWorker:
         track-retirement window and stopped anything from ever confirming, so
         batching here is load-bearing, not a micro-optimisation.
 
-        Caller already holds the lock.
+        Called without the lock - see the note at the call site.
         """
         if self.classifier is None or self.scaler is None:
             return

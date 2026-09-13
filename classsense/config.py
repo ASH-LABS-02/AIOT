@@ -123,6 +123,15 @@ TIER_FULL_MIN_WIDTH   = 64   # full analysis, all states including Sleepy
 TIER_COARSE_MIN_WIDTH = 40   # pose only; Attentive / Distracted
 # below TIER_COARSE_MIN_WIDTH: presence only, state Unknown
 
+# Typical cheek-width to face-height ratio, measured at 0.887 +/- 0.025 across
+# DAiSEE frames. Used to derive a yaw-invariant face size: cheek width
+# foreshortens as cos(yaw), so a student turning 40 degrees would lose about a
+# quarter of their apparent width and be demoted out of the tier that permits
+# Sleepy detection - precisely when they are most worth watching. Face height
+# does not foreshorten with yaw, so scaling it by this ratio gives a second
+# estimate that holds steady through a turn.
+FACE_WIDTH_TO_HEIGHT = 0.887
+
 # ── Throughput ─────────────────────────────────
 # Measured on 20 cores, CPU-only torch (see scripts/benchmark.py):
 #   detect() @ 96/128/192px crop : 7.13 / 7.21 / 6.71 ms  (flat)
@@ -140,6 +149,18 @@ MP_CROP_MAX_SIDE       = 192   # above this MediaPipe costs double for nothing
 YOLO_INPUT_WIDTH       = 1280  # 1280 over 960: back-row students are small
 MAX_STUDENTS_PER_CYCLE = 60
 CROP_PADDING           = 20    # px of context around a YOLO box
+
+# Cycles between YOLO passes. Profiling a 60-student cycle put YOLO at 124ms
+# of 263ms - 47% - spent re-finding people who have not moved. Seated students
+# keep their positions for seconds at a time, while the things that actually
+# change (eyes, mouth, head angle) are read from landmarks every cycle
+# regardless. So person detection runs periodically and landmark analysis runs
+# continuously.
+#
+# The cost is admission latency: a student entering the room is picked up
+# within DETECT_EVERY cycles, about half a second here. CROP_PADDING absorbs
+# the box drift of someone shifting in their seat between passes.
+DETECT_EVERY = 3
 
 # Adaptive scheduling: when the cohort exceeds MAX_STUDENTS_PER_CYCLE, sample
 # by priority instead of blindly cycling. A student holding one state for

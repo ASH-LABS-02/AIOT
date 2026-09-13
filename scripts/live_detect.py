@@ -25,7 +25,6 @@ from classsense.pipeline import AnalysisWorker, FrameSource      # noqa: E402
 from classsense.render import (                                  # noqa: E402
     draw_student, draw_dashboard, draw_banner, CROWDED_THRESHOLD,
 )
-from classsense.tiers import Tier                                # noqa: E402
 
 
 def load_model(allow_weak=False):

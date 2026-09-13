@@ -70,6 +70,11 @@ def run_case(worker, frame, cycles):
         tiers[student.tier] += 1
 
     return {
+        # Mean, not median. Person detection runs only every DETECT_EVERY
+        # cycles, so the distribution is bimodal - a median lands on a cheap
+        # landmark-only cycle and flatters the sustained rate. The mean is what
+        # a student's refresh interval actually averages out to.
+        "mean_ms": statistics.mean(timings),
         "median_ms": statistics.median(timings),
         "p95_ms": sorted(timings)[int(len(timings) * 0.95) - 1],
         "tracked": len(worker.tracker.students),
@@ -91,9 +96,9 @@ def main():
                    help="write each synthetic frame to data/snapshots")
     args = p.parse_args()
 
-    print("=" * 74)
+    print("=" * 84)
     print("ClassSense stress test - synthetic tiled classroom @ 1080p")
-    print("=" * 74)
+    print("=" * 84)
     print(f"cores {os.cpu_count()}   pool {args.pool}   "
           f"yolo {args.yolo_width}px   cycles/case {args.cycles}")
 
@@ -106,9 +111,9 @@ def main():
         max_per_cycle=max(args.cells) if args.cells else 60,
     )
 
-    print(f"{'cells':>6} {'median':>9} {'p95':>9} {'cycles/s':>9} "
-          f"{'refresh':>9} {'found':>7} {'full':>6} {'coarse':>7} {'far':>5}")
-    print("-" * 74)
+    print(f"{'cells':>6} {'mean':>9} {'median':>9} {'p95':>9} {'cycles/s':>9} "
+          f"{'refresh':>9} {'found':>6} {'full':>5} {'coarse':>7} {'far':>4}")
+    print("-" * 84)
 
     rows = []
     try:
@@ -124,24 +129,25 @@ def main():
             worker.tracker.students.clear()
             r = run_case(worker, tiled, args.cycles)
 
-            cps = 1000.0 / r["median_ms"] if r["median_ms"] else 0.0
+            cps = 1000.0 / r["mean_ms"] if r["mean_ms"] else 0.0
             # Every scheduled student is analysed each cycle here, so refresh
-            # equals cycle time. It would exceed it only once the cohort
+            # equals mean cycle time. It would exceed it only once the cohort
             # outgrows max_per_cycle and scheduling starts rotating.
-            refresh = r["median_ms"] / 1000.0
+            refresh = r["mean_ms"] / 1000.0
             flag = "" if refresh <= 1.0 else " SLOW"
 
-            print(f"{cells:>6} {r['median_ms']:>8.1f}ms {r['p95_ms']:>8.1f}ms "
-                  f"{cps:>9.2f} {refresh:>8.2f}s {r['confirmed']:>7} "
-                  f"{r['tiers'][Tier.FULL]:>6} {r['tiers'][Tier.COARSE]:>7} "
-                  f"{r['tiers'][Tier.PRESENCE]:>5}{flag}")
+            print(f"{cells:>6} {r['mean_ms']:>7.1f}ms {r['median_ms']:>7.1f}ms "
+                  f"{r['p95_ms']:>7.1f}ms {cps:>9.2f} {refresh:>8.2f}s "
+                  f"{r['confirmed']:>6} {r['tiers'][Tier.FULL]:>5} "
+                  f"{r['tiers'][Tier.COARSE]:>7} "
+                  f"{r['tiers'][Tier.PRESENCE]:>4}{flag}")
             rows.append((cells, r, refresh))
     finally:
         worker.stop()
 
-    print("\n" + "=" * 74)
+    print("\n" + "=" * 84)
     print("Reading this")
-    print("=" * 74)
+    print("=" * 84)
     print("refresh = seconds between successive looks at any one student.")
     print("Eye-closure detection needs refresh well under SLEEPY_EYES_DURATION")
     print(f"({config.SLEEPY_EYES_DURATION}s) to get several samples inside a closure.")
@@ -160,7 +166,11 @@ def main():
         if biggest:
             cells, r, refresh = biggest
             print(f"Within budget through {cells} students "
-                  f"({r['median_ms']:.0f}ms/cycle, {refresh:.2f}s refresh).")
+                  f"({r['mean_ms']:.0f}ms mean cycle, {refresh:.2f}s refresh).")
+            print(f"Mean and median differ ({r['mean_ms']:.0f} vs "
+                  f"{r['median_ms']:.0f}ms) because person detection runs only")
+            print(f"every {config.DETECT_EVERY} cycles - cheap landmark-only cycles "
+                  f"between costly detect ones.")
 
 
 if __name__ == "__main__":

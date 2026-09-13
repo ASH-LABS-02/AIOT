@@ -4,8 +4,8 @@ Real-time classroom engagement monitoring. Detects people with YOLOv8, reads fac
 landmarks with MediaPipe, and classifies each student as **Attentive**, **Sleepy**,
 **Distracted**, or **Unknown** using temporal rules over eye, mouth and head-pose signals.
 
-Measured at **60 students in a single 1080p frame at 3.7 analysis cycles per second on
-CPU** — every student re-examined roughly four times a second, no GPU.
+Measured at **60 students in a single 1080p frame at 6.0 analysis cycles per second on
+CPU** — every student re-examined roughly six times a second, no GPU.
 
 ---
 
@@ -50,7 +50,7 @@ width and the back row 40px. Rather than print identical-looking labels of wildl
 different trustworthiness, each student is tiered by **measured face width** and the tier
 bounds what may be concluded:
 
-| Tier | Face width | Analysis | States reachable |
+| Tier | Face size | Analysis | States reachable |
 |---|---|---|---|
 | `FULL` | ≥ 64px | eyes, mouth, head pose | all, including Sleepy |
 | `COARSE` | 40–64px | head pose only | Attentive, Distracted |
@@ -60,6 +60,13 @@ Eye aspect ratio is suppressed below `FULL` because at a 50px face the eye landm
 about 3px apart — one pixel of jitter moves EAR by ~10%, more than the gap between an open
 and a closed eye. Head pose spans the whole face and degrades gracefully, so it survives
 one tier lower.
+
+"Face size" is deliberately not cheek-to-cheek width. Width projects as cos(yaw), so a
+student turning 40° loses about a quarter of their apparent width and drops a tier — losing
+Sleepy detection at the moment they are most worth watching. Face *height* does not
+foreshorten with yaw, so `face_size_px` takes the larger of the width and the height scaled
+by the measured 0.887 width-to-height ratio. A frontal face uses whichever is cleaner; a
+turned face keeps its tier.
 
 The dashboard computes class engagement over **readable students only**. Counting the
 unreadable back row as disengaged would make the percentage a measure of camera placement
@@ -77,18 +84,22 @@ pipeline against a synthetic tiled classroom.
 
 On 20 CPU cores, no GPU, `torch 2.12.1+cpu`:
 
-| Students | Cycle | Cycles/s | Refresh |
-|---|---|---|---|
-| 10 | 135 ms | 7.4 | 0.14 s |
-| 20 | 164 ms | 6.1 | 0.16 s |
-| 30 | 196 ms | 5.1 | 0.20 s |
-| 45 | 229 ms | 4.4 | 0.23 s |
-| **60** | **269 ms** | **3.7** | **0.27 s** |
+| Students | Mean cycle | Median | p95 | Cycles/s | Refresh |
+|---|---|---|---|---|---|
+| 10 | 59 ms | 32 ms | 131 ms | 16.9 | 0.06 s |
+| 20 | 82 ms | 49 ms | 157 ms | 12.3 | 0.08 s |
+| 30 | 101 ms | 70 ms | 172 ms | 9.9 | 0.10 s |
+| 45 | 127 ms | 102 ms | 213 ms | 7.9 | 0.13 s |
+| **60** | **168 ms** | **143 ms** | **284 ms** | **6.0** | **0.17 s** |
 
-"Refresh" is the gap between successive looks at any one student. At 0.27s a 1.2s eye
-closure gets roughly four samples, so Sleepy detection remains viable at full capacity.
+"Refresh" is the gap between successive looks at any one student. At 0.17s a 1.2s eye
+closure gets roughly seven samples, so Sleepy detection is comfortable at full capacity.
 
-Three findings shaped the design:
+Mean and median differ because person detection runs only every third cycle — cheap
+landmark-only cycles sit between costly detect ones. The **mean** is the honest figure for
+sustained throughput; a median would land on a cheap cycle and flatter the result.
+
+Four findings shaped the design:
 
 - **MediaPipe `detect()` releases the GIL** — 3.21× across 8 threads. A thread pool is
   genuinely parallel, which is what makes 60 students affordable without a GPU.
@@ -96,6 +107,11 @@ Three findings shaped the design:
   96 / 128 / 192px, then 14.67 ms at 256px. Crops are capped at 192px, aspect preserved.
 - **Batching the classifier matters enormously** — 60 separate `predict_proba` calls on a
   300-tree forest measure 3.7s; the same 60 rows batched measure 56ms.
+- **YOLO was 47% of the cycle** re-finding people who had not moved (124ms of 263ms).
+  Person detection now runs every `DETECT_EVERY` cycles while landmark analysis runs
+  continuously, since eyes, mouth and head angle are what actually change. This alone took
+  60 students from 269ms to 168ms. The cost is admission latency: a student entering the
+  room is picked up within about half a second.
 
 Run them yourself:
 
@@ -165,7 +181,7 @@ scripts/
   train_model.py       train + subject-independent evaluation
   check_paths.py       what dataset is actually on disk
 
-tests/                 66 tests
+tests/                 75 tests
 ```
 
 `geometry.py` is imported by **both** the training extractor and the live pipeline. That
@@ -209,11 +225,11 @@ the live pipeline acts on.
 python -m pytest tests/ -v
 ```
 
-Covers geometry scale-invariance, tier boundaries, tracker association (including that
-adjacent students do not swap identity), the temporal gates, and the heuristic/model
-handoff. Several are regression guards for specific bugs: the feature-unit skew, and a
-tracking deadlock where wall-clock retirement ran faster than confirmation and the room
-read as permanently empty.
+Covers geometry scale-invariance, yaw-robust face sizing, tier boundaries, tracker
+association (including that adjacent students do not swap identity), the temporal gates,
+and the heuristic/model handoff. Several are regression guards for specific bugs: the
+feature-unit skew, and a tracking deadlock where wall-clock retirement ran faster than
+confirmation and the room read as permanently empty.
 
 ---
 
@@ -221,8 +237,11 @@ read as permanently empty.
 
 - **CPU only.** `torch` is a CPU build; all figures above are CPU figures. A CUDA wheel
   would help YOLO, not MediaPipe.
-- **Boxes lag the image** by up to one analysis cycle (~270ms at 60 students). Invisible
+- **Boxes lag the image** by up to one analysis cycle (~170ms at 60 students). Invisible
   for seated students; not suitable for fast motion.
+- **A student entering the room takes up to ~0.5s to be picked up**, because person
+  detection runs every third cycle. Lower `DETECT_EVERY` to 1 if admission latency matters
+  more than throughput.
 - **The stress test proves throughput, not accuracy.** It tiles one face 60 times — same
   angle, same lighting. Real classrooms vary in both.
 - **Tracking is IoU-based**, which suits seated students. People who cross paths may swap

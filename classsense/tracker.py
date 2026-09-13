@@ -15,7 +15,6 @@ from classsense.config import (
 )
 from classsense.geometry import compute_box_iou
 from classsense.states import EngagementState
-from classsense.tiers import Tier
 
 
 class TrackedStudent:

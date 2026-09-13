@@ -249,7 +249,7 @@ def main():
     oof_auc = roc_auc_score(y, oof_proba)
     oof_f1 = f1_score(y, oof_pred)
 
-    print(f"\nOut-of-fold, default 0.50 threshold:")
+    print("\nOut-of-fold, default 0.50 threshold:")
     print(classification_report(y, oof_pred, target_names=config.CLASS_NAMES,
                                 digits=3, zero_division=0))
     print(f"accuracy          : {oof_acc:.3f}")

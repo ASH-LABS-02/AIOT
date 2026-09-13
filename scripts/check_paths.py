@@ -12,7 +12,6 @@ import argparse
 import os
 import sys
 from collections import Counter
-from pathlib import Path
 
 import pandas as pd
 
@@ -82,7 +81,7 @@ def main():
     print(f"subjects absent    : {len(missing_people)}")
 
     if missing_examples:
-        print(f"\nexample missing paths:")
+        print("\nexample missing paths:")
         for path in missing_examples:
             print(f"  {path}")
 

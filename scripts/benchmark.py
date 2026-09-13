@@ -11,16 +11,19 @@ import os
 import sys
 import time
 import statistics
-import threading
 from concurrent.futures import ThreadPoolExecutor
 
 import cv2
 import numpy as np
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-MP_MODEL = os.path.join("scripts", "face_landmarker.task")
-DAISEE_TRAIN = r"C:\Users\AR\Downloads\DAiSEE\DAiSEE\DataSet\Train"
+from classsense.config import (                                  # noqa: E402
+    MP_MODEL, DAISEE_ROOT, DETECT_EVERY, YOLO_INPUT_WIDTH,
+    YOLO_WEIGHTS, SLEEPY_EYES_DURATION,
+)
+
+DAISEE_TRAIN = os.path.join(DAISEE_ROOT, "DataSet", "Train")
 
 WARMUP = 3
 TRIALS = 30
@@ -143,7 +146,7 @@ def bench_mediapipe(face_bgr):
         print("VERDICT: detect() appears GIL-bound. A thread pool will NOT help;")
         print("         use process-based parallelism or reduce students per cycle.")
     else:
-        print(f"VERDICT: detect() releases the GIL. Thread pool is worth it.")
+        print("VERDICT: detect() releases the GIL. Thread pool is worth it.")
         print(f"         Recommended MP_POOL_SIZE = {best_n}")
 
     det.close()
@@ -157,7 +160,7 @@ def bench_yolo(frame):
     print("3. YOLOv8n person detection by input width (CPU)")
     print("=" * 64)
 
-    yolo = YOLO("yolov8n.pt")
+    yolo = YOLO(YOLO_WEIGHTS)
     full = cv2.resize(frame, (1920, 1080), interpolation=cv2.INTER_LINEAR)
 
     print(f"{'imgsz':>8} {'median ms':>11} {'min':>8} {'max':>8} {'persons':>9}")
@@ -174,36 +177,58 @@ def bench_yolo(frame):
     return out
 
 
-def project_budget(mp_results, mp_per_size, yolo_ms):
-    """Translate the measurements into a students-per-second budget."""
+def project_budget(mp_results, yolo_ms):
+    """
+    Translate the measurements into a students-per-second budget.
+
+    Models what the pipeline actually does: all students analysed every cycle,
+    with person detection amortised across DETECT_EVERY cycles. Verify the
+    projection against reality with scripts/stress_test.py, which runs the
+    real worker rather than this arithmetic.
+    """
     print("\n" + "=" * 64)
-    print("4. Projected budget for 60 students @ 1080p")
+    print("4. Projected budget @ 1080p")
     print("=" * 64)
 
     best_n = max(mp_results, key=lambda k: mp_results[k][1])
     ms_per_face = mp_results[best_n][0]
-    yolo_960 = yolo_ms.get(960, 0.0)
 
-    print(f"MediaPipe per face (pooled, {best_n} threads): {ms_per_face:.2f} ms")
-    print(f"YOLO @ 960px                                : {yolo_960:.2f} ms")
+    # Match the pipeline's configured YOLO width, falling back to whichever
+    # measured width is closest if that one was not benchmarked.
+    width = min(yolo_ms, key=lambda k: abs(k - YOLO_INPUT_WIDTH))
+    yolo_cost = yolo_ms[width]
+
+    print(f"MediaPipe per face (pooled, {best_n} threads) : {ms_per_face:.2f} ms")
+    print(f"YOLO @ {width}px                              : {yolo_cost:.2f} ms")
+    print(f"Detection runs every {DETECT_EVERY} cycles, so it costs "
+          f"{yolo_cost / DETECT_EVERY:.1f} ms amortised.")
     print()
-    print(f"{'batch':>7} {'mp ms':>9} {'cycle ms':>10} {'cycles/s':>10} {'refresh 60':>12}")
+    print(f"{'students':>9} {'mp ms':>8} {'+yolo':>8} {'mean cycle':>12} "
+          f"{'cycles/s':>10} {'refresh':>9}")
     print("-" * 64)
-    for batch in (8, 12, 16, 20, 30, 60):
-        mp_ms = ms_per_face * batch
-        cycle = yolo_960 + mp_ms
+    for n in (10, 20, 30, 45, 60, 80):
+        mp_ms = ms_per_face * n
+        amortised = yolo_cost / DETECT_EVERY
+        cycle = mp_ms + amortised
         cps = 1000.0 / cycle if cycle else 0
-        refresh = (60 / batch) / cps if cps else float("inf")
+        refresh = cycle / 1000.0
         flag = "" if refresh <= 1.0 else "  <-- too slow"
-        print(f"{batch:>7} {mp_ms:>9.1f} {cycle:>10.1f} {cps:>10.2f} {refresh:>11.2f}s{flag}")
+        print(f"{n:>9} {mp_ms:>8.1f} {amortised:>8.1f} {cycle:>11.1f}ms "
+              f"{cps:>10.2f} {refresh:>8.2f}s{flag}")
 
-    print("\n'refresh 60' = seconds for every one of 60 students to be re-examined.")
-    print("Target <= 1.0s so a 1.2s eye-closure window still gets >= 2 samples.")
+    print("\n'refresh' = seconds between successive looks at any one student.")
+    print(f"Target well under SLEEPY_EYES_DURATION ({SLEEPY_EYES_DURATION}s) so a")
+    print("closure is sampled several times rather than aliased.")
+    print()
+    print("These are projections. Confirm them with:")
+    print("  python scripts/stress_test.py")
 
 
 def main():
     if not os.path.exists(MP_MODEL):
-        print(f"ERROR: {MP_MODEL} missing. Run from the repo root.")
+        print(f"ERROR: {MP_MODEL} missing.")
+        print("Run scripts/live_detect.py once to fetch it, or "
+              "scripts/test_setup.py to check the environment.")
         sys.exit(1)
 
     print("=" * 64)
@@ -219,9 +244,9 @@ def main():
     frame = find_sample_face_frame()
     print(f"Frame    : {frame.shape[1]}x{frame.shape[0]}")
 
-    mp_results, mp_per_size = bench_mediapipe(frame)
+    mp_results, _ = bench_mediapipe(frame)
     yolo_ms = bench_yolo(frame)
-    project_budget(mp_results, mp_per_size, yolo_ms)
+    project_budget(mp_results, yolo_ms)
 
     print("\nDone.")
 
