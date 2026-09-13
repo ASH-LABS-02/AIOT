@@ -1,0 +1,34 @@
+{
+  "features": [
+    "left_ear",
+    "right_ear",
+    "avg_ear",
+    "mar",
+    "yaw",
+    "pitch",
+    "roll"
+  ],
+  "class_names": [
+    "Drifting",
+    "Engaged"
+  ],
+  "engagement_positive_min": 3,
+  "n_samples": 821,
+  "n_subjects": 13,
+  "params": {
+    "max_depth": 5,
+    "min_samples_split": 2,
+    "n_estimators": 300
+  },
+  "evaluation": "GroupKFold by person_id",
+  "folds": 5,
+  "oof_accuracy": 0.5591,
+  "oof_balanced_accuracy": 0.5584,
+  "oof_roc_auc": 0.5906,
+  "majority_baseline": 0.5493,
+  "threshold_p_engaged": 0.5,
+  "threshold_p_drifting": 0.5,
+  "threshold_note": "kept 0.50 - AUC 0.591 is below 0.65, so the apparent best threshold 0.60 (+0.021) is not distinguishable from noise",
+  "advisory_only": true,
+  "advisory_reason": "ROC AUC 0.591 is below 0.65; accuracy 0.559 against a 0.549 majority baseline"
+}
