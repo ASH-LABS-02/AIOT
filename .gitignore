@@ -47,6 +47,8 @@ models/checkpoints/
 data/raw/
 data/processed/
 snapshots/
+# Session reports are per-lesson artefacts, regenerated every run.
+data/reports/
 
 # Per-machine calibration written by scripts/calibrate.py. Deliberately NOT
 # tracked: it describes the timings of one specific machine, and committing a

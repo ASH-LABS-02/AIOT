@@ -66,7 +66,22 @@ Headless, with a web view and JSON status — for a Pi, or any machine with no d
 python scripts/live_detect.py --headless --serve 8080
 ```
 
-`/` live view and tallies · `/stream` MJPEG · `/status` JSON · `/snapshot` one JPEG.
+`/` live view and tallies · `/stream` MJPEG · `/status` JSON · `/snapshot` one JPEG ·
+`/report` the live session dashboard · `/report.json` the same numbers as data.
+
+Every run records a session and writes a report on exit — a self-contained HTML page
+(no CDN, so it opens offline) plus JSON. `--duration 3000` stops cleanly after a lesson
+and writes it; `--no-record` skips it.
+
+The report leads with **average attentiveness**, then students seen, the share who never
+fell asleep, the share of monitored time awake, sleep episodes with their longest, and mean
+coverage — followed by attentiveness over the session, who was in which state, and a
+per-student table ordered lowest-first.
+
+Scores are over **monitored** time only. Unknown and Unmonitored seconds are excluded
+rather than counted as inattention, so poor camera placement cannot read as poor
+engagement — and coverage is printed beside every score so a high number over a small
+slice of the lesson cannot pass as a high number over all of it.
 There is no authentication and it streams a live camera feed of a room, so keep it on a
 trusted network.
 
@@ -221,6 +236,8 @@ classsense/            the package — importable, testable, no entry points
   render.py            overlay and dashboard
   pipeline.py          capture / analysis / render threading
   capacity.py          what this machine may honestly watch
+  session.py           per-lesson time accounting
+  report_html.py       the session report, self-contained HTML
   detector.py          backend selection + NCNN width guard
   server.py            MJPEG + JSON output, standard library only
 
@@ -235,7 +252,7 @@ scripts/
   export_ncnn.py       export YOLO to NCNN for ARM
   diagnose_duplicates.py  why one person is being counted as more than one
 
-tests/                 134 tests
+tests/                 169 tests
 ```
 
 `geometry.py` is imported by **both** the training extractor and the live pipeline. That

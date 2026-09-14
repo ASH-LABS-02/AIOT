@@ -32,6 +32,7 @@ from classsense.render import (                                 # noqa: E402
     draw_student, draw_dashboard, draw_banner, CROWDED_THRESHOLD,
 )
 from classsense.server import StreamProvider, serve             # noqa: E402
+from classsense.session import SessionRecorder                  # noqa: E402
 
 
 def load_model(allow_weak=False):
@@ -138,6 +139,13 @@ def parse_args():
     p.add_argument("--allow-over-capacity", action="store_true",
                    help="analyse everyone at reduced fidelity instead of "
                         "reporting the overflow as Unmonitored")
+    p.add_argument("--duration", type=float, default=None, metavar="SECONDS",
+                   help="stop cleanly after this long and write the report; "
+                        "a lesson has a length, and a hard kill loses the session")
+    p.add_argument("--no-record", action="store_true",
+                   help="skip session recording and the written report")
+    p.add_argument("--report-dir", default=None,
+                   help="where to write the session report (default data/reports)")
     p.add_argument("--debug", action="store_true", help="start with the HUD on")
     return p.parse_args()
 
@@ -188,6 +196,51 @@ def build_status(counts, students, readable, worker, cap, over, fps,
         "note": note,
         "updated": time.strftime("%Y-%m-%dT%H:%M:%S"),
     }
+
+
+def write_report(recorder, directory=None):
+    """Close the session and write both the readable and machine copies."""
+    from classsense import report_html
+
+    recorder.finalise()
+    report = recorder.report()
+    head = report["headline"]
+
+    directory = directory or os.path.join(config.DATA_DIR, "reports")
+    os.makedirs(directory, exist_ok=True)
+    stem = time.strftime("session_%Y%m%d_%H%M%S",
+                         time.localtime(recorder.started))
+
+    json_path = recorder.save(directory, stem)
+    html_path = os.path.join(directory, f"{stem}.html")
+    with open(html_path, "w", encoding="utf-8") as fh:
+        fh.write(report_html.render(report))
+
+    print("\n" + "=" * 60, flush=True)
+    print("Session report", flush=True)
+    print("=" * 60, flush=True)
+    print(f"  duration        : {report['session']['duration_s']:.0f}s", flush=True)
+    print(f"  students seen   : {head['students_seen']} "
+          f"(peak {head['peak_present']} at once)", flush=True)
+    if head["mean_attentiveness"] is not None:
+        print(f"  attentiveness   : {head['mean_attentiveness'] * 100:.0f}% mean"
+              f"   {head['weighted_attentiveness'] * 100:.0f}% time-weighted",
+              flush=True)
+    if head["pct_never_slept"] is not None:
+        print(f"  never slept     : {head['pct_never_slept']:.0f}% of students "
+              f"({head['students_slept']} did)", flush=True)
+    if head["pct_time_not_sleeping"] is not None:
+        print(f"  awake           : {head['pct_time_not_sleeping']:.1f}% "
+              f"of monitored time", flush=True)
+    print(f"  sleep episodes  : {head['sleep_episodes']}, longest "
+          f"{head['longest_sleep_s']:.0f}s", flush=True)
+    mean_cov = report["coverage"]["mean_coverage"]
+    if mean_cov is not None:
+        print(f"  mean coverage   : {mean_cov * 100:.0f}% of time readable",
+              flush=True)
+    print(f"\n  report : {html_path}", flush=True)
+    print(f"  data   : {json_path}", flush=True)
+    return html_path
 
 
 def main():
@@ -246,12 +299,18 @@ def main():
         backend=backend,
     ).start(source)
 
+    recorder = None if args.no_record else SessionRecorder()
+    if recorder is not None:
+        print("Recording session. Report written on exit; live at /report "
+              "when serving.", flush=True)
+
     provider, httpd = None, None
     if args.serve:
-        provider = StreamProvider(stream_fps=args.stream_fps)
+        provider = StreamProvider(stream_fps=args.stream_fps,
+                                  recorder=recorder)
         httpd = serve(provider, port=args.serve)
         print(f"\nServing on http://0.0.0.0:{args.serve}  "
-              f"(/, /stream, /status, /snapshot)", flush=True)
+              f"(/, /stream, /status, /snapshot, /report)", flush=True)
         print("  No authentication - keep this on a trusted network.",
               flush=True)
 
@@ -277,9 +336,13 @@ def main():
 
     fps_ema = None
     last_t = time.time()
+    deadline = (time.time() + args.duration) if args.duration else None
 
     try:
         while source.running and not stopping["now"]:
+            if deadline is not None and time.time() >= deadline:
+                print(f"\nReached --duration {args.duration:.0f}s.", flush=True)
+                break
             frame = source.read()
             if frame is None:
                 break
@@ -292,6 +355,11 @@ def main():
 
             students, counts, tracked, readable = worker.snapshot()
             over = worker.over_capacity
+
+            # Fed from the same snapshot the renderer uses, so recording can
+            # never perturb the analysis thread or contend for its lock.
+            if recorder is not None:
+                recorder.observe(students, now)
 
             # Drawing is not free on a Pi. Skip it entirely when nobody can
             # see the result, so those cycles go to analysis instead.
@@ -361,6 +429,10 @@ def main():
         print(f"\n{worker.cycles} analysis cycles, "
               f"{worker.cycle_ms:.0f}ms each "
               f"({worker.analysis_fps:.1f}/s).", flush=True)
+
+    if recorder is not None:
+        write_report(recorder, args.report_dir)
+
     print("Stopped.", flush=True)
     return 0
 

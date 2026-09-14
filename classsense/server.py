@@ -23,6 +23,21 @@ import cv2
 
 BOUNDARY = "classsense-frame"
 
+# Shape of a report with nothing in it, so /report renders a real (empty) page
+# rather than erroring before the first student is seen.
+_EMPTY_REPORT = {
+    "session": {"started": "—", "ended": "—",
+                "duration_s": 0, "samples": 0},
+    "headline": {"students_seen": 0, "peak_present": 0, "students_readable": 0,
+                 "pct_never_slept": None, "pct_time_not_sleeping": None,
+                 "mean_attentiveness": None, "weighted_attentiveness": None,
+                 "students_slept": 0, "sleep_episodes": 0,
+                 "total_sleep_s": 0.0, "longest_sleep_s": 0.0},
+    "coverage": {"monitored_s": 0.0, "present_s": 0.0,
+                 "mean_coverage": None, "unreadable_s": 0.0},
+    "state_seconds": {}, "timeline": [], "students": [],
+}
+
 PAGE = """<!doctype html>
 <title>ClassSense</title>
 <style>
@@ -42,7 +57,9 @@ PAGE = """<!doctype html>
   .dis { color:#f05252; } .unk { color:#9aa0a6; }
   #note { padding:0 14px 14px; color:#9aa0a6; font-size:12px; max-width:60ch; }
 </style>
-<header><h1>ClassSense</h1></header>
+<header><h1>ClassSense</h1>
+<a href="/report" style="color:#7ab7ff;font-size:13px">session report &rarr;</a>
+</header>
 <div id="wrap">
   <img src="/stream" alt="live view">
   <div id="side"></div>
@@ -108,6 +125,14 @@ class _Handler(BaseHTTPRequestHandler):
                 self._send(503, "text/plain", b"no frame yet")
             else:
                 self._send(200, "image/jpeg", jpeg, {"Cache-Control": "no-store"})
+        elif path in ("/report", "/dashboard"):
+            body = self.provider.report_html().encode("utf-8")
+            self._send(200, "text/html; charset=utf-8", body,
+                       {"Cache-Control": "no-store"})
+        elif path == "/report.json":
+            body = self.provider.report_json().encode("utf-8")
+            self._send(200, "application/json", body,
+                       {"Cache-Control": "no-store"})
         elif path == "/stream":
             self._stream()
         else:
@@ -149,7 +174,11 @@ class StreamProvider:
     viewer - so a second person opening the page costs nothing but bandwidth.
     """
 
-    def __init__(self, jpeg_quality=70, stream_fps=8):
+    def __init__(self, jpeg_quality=70, stream_fps=8, recorder=None):
+        # The session recorder, if one is running. Rendered on demand rather
+        # than cached: a report is requested rarely and read carefully, so a
+        # stale one is worth far less than the milliseconds it would save.
+        self.recorder = recorder
         self._frame = None
         self._jpeg = None
         self._jpeg_stamp = -1.0
@@ -187,6 +216,24 @@ class StreamProvider:
     def status(self):
         with self._lock:
             return dict(self._status)
+
+    def report_html(self):
+        from classsense import report_html
+        if self.recorder is None:
+            return report_html.render(
+                _EMPTY_REPORT, live=True,
+                title="ClassSense — no session recording",
+            )
+        return report_html.render(
+            self.recorder.report(), live=True,
+            title="ClassSense — session in progress",
+        )
+
+    def report_json(self):
+        import json as _json
+        if self.recorder is None:
+            return _json.dumps(_EMPTY_REPORT, indent=2)
+        return _json.dumps(self.recorder.report(), indent=2)
 
 
 def serve(provider, port=8080, host="0.0.0.0"):
