@@ -26,11 +26,12 @@ import numpy as np
 from classsense.config import (
     YOLO_CONF_THRESH, YOLO_INPUT_WIDTH, MP_POOL_SIZE, MP_FACE_CONF_THRESH,
     MAX_STUDENTS_PER_CYCLE, CROP_PADDING, CAPTURE_WIDTH, CAPTURE_HEIGHT,
-    CAPTURE_INDEX, YOLO_WEIGHTS, DETECT_EVERY, REFUSE_BEYOND_CAPACITY,
+    CAPTURE_INDEX, DETECT_EVERY, REFUSE_BEYOND_CAPACITY,
 )
 from classsense.geometry import (
     extract_feature_row, face_size_px, face_centre_in_frame,
 )
+from classsense.detector import load_detector
 from classsense.mp_pool import MediaPipePool, prepare_crop
 from classsense.tiers import tier_for_face_width, Tier
 from classsense.tracker import StudentTracker
@@ -118,10 +119,13 @@ class AnalysisWorker:
                  pool_size=MP_POOL_SIZE, yolo_width=YOLO_INPUT_WIDTH,
                  max_per_cycle=MAX_STUDENTS_PER_CYCLE,
                  detect_every=DETECT_EVERY,
-                 refuse_beyond_capacity=REFUSE_BEYOND_CAPACITY):
-        from ultralytics import YOLO
-
-        self.yolo = YOLO(YOLO_WEIGHTS)
+                 refuse_beyond_capacity=REFUSE_BEYOND_CAPACITY,
+                 backend="pytorch"):
+        # load_detector refuses an NCNN model whose export width does not
+        # match, because that combination returns zero detections silently.
+        self.yolo, self.backend = load_detector(
+            backend=backend, yolo_width=yolo_width, strict=False
+        )
         self.pool = MediaPipePool(pool_size, face_conf=MP_FACE_CONF_THRESH)
         self.executor = ThreadPoolExecutor(max_workers=pool_size)
 

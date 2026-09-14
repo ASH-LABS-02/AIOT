@@ -131,6 +131,8 @@ def parse_args():
                    help="MediaPipe detectors (default: from calibration)")
     p.add_argument("--yolo-width", type=int, default=None,
                    help="YOLO input width (default: from calibration)")
+    p.add_argument("--backend", choices=("pytorch", "ncnn"), default=None,
+                   help="detector backend (default: from calibration)")
     p.add_argument("--detect-every", type=int, default=None,
                    help="cycles between detection passes (default: from calibration)")
     p.add_argument("--allow-over-capacity", action="store_true",
@@ -204,6 +206,7 @@ def main():
     pool_size = args.pool or cap.pool_size
     yolo_width = args.yolo_width or cap.yolo_width
     detect_every = args.detect_every or cap.detect_every
+    backend = args.backend or cap.backend
     max_students = args.students or cap.max_students()
 
     print(cap.summary(), flush=True)
@@ -240,6 +243,7 @@ def main():
         pool_size=pool_size, yolo_width=yolo_width,
         max_per_cycle=max_students, detect_every=detect_every,
         refuse_beyond_capacity=not args.allow_over_capacity,
+        backend=backend,
     ).start(source)
 
     provider, httpd = None, None

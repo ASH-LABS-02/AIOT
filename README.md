@@ -221,6 +221,7 @@ classsense/            the package — importable, testable, no entry points
   render.py            overlay and dashboard
   pipeline.py          capture / analysis / render threading
   capacity.py          what this machine may honestly watch
+  detector.py          backend selection + NCNN width guard
   server.py            MJPEG + JSON output, standard library only
 
 scripts/
@@ -231,9 +232,10 @@ scripts/
   train_model.py       train + subject-independent evaluation
   check_paths.py       what dataset is actually on disk
   calibrate.py         measure THIS machine, write its tuning
+  export_ncnn.py       export YOLO to NCNN for ARM
   diagnose_duplicates.py  why one person is being counted as more than one
 
-tests/                 117 tests
+tests/                 134 tests
 ```
 
 `geometry.py` is imported by **both** the training extractor and the live pipeline. That

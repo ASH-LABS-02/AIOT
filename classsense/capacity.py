@@ -31,7 +31,8 @@ class Capacity:
     """What this machine measured, and what follows from it."""
 
     def __init__(self, per_face_ms, detect_ms, cores, pool_size,
-                 yolo_width, detect_every, samples_per_gate, source="measured"):
+                 yolo_width, detect_every, samples_per_gate,
+                 source="measured", backend="pytorch"):
         self.per_face_ms = per_face_ms
         self.detect_ms = detect_ms
         self.cores = cores
@@ -40,6 +41,9 @@ class Capacity:
         self.detect_every = detect_every
         self.samples_per_gate = samples_per_gate
         self.source = source
+        # Which detector backend was measured fastest here. An NCNN model is
+        # bound to the width it was exported at, so the two travel together.
+        self.backend = backend
 
     # ── the fidelity budget ────────────────────
     @property
@@ -143,6 +147,7 @@ class Capacity:
             "detect_ms": round(self.detect_ms, 2),
             "pool_size": self.pool_size,
             "yolo_width": self.yolo_width,
+            "backend": self.backend,
             "detect_every": self.detect_every,
             "samples_per_gate": self.samples_per_gate,
             "shortest_gate_s": self.shortest_gate,
@@ -158,7 +163,8 @@ class Capacity:
     def summary(self):
         lines = [
             f"cores {self.cores}, pool {self.pool_size}, "
-            f"yolo {self.yolo_width}px every {self.detect_every} cycles",
+            f"yolo {self.yolo_width}px ({self.backend}) "
+            f"every {self.detect_every} cycles",
             f"per face {self.per_face_ms:.1f}ms, "
             f"detection {self.detect_ms:.0f}ms "
             f"({self.amortised_detect_ms:.0f}ms amortised)",
@@ -273,6 +279,7 @@ def load(path=None):
                 data.get("samples_per_gate", config.FIDELITY_SAMPLES_PER_GATE)
             ),
             source="measured",
+            backend=str(data.get("backend", "pytorch")),
         )
     except (KeyError, ValueError, TypeError, json.JSONDecodeError) as exc:
         print(f"Could not read {path} ({exc}); falling back to an estimate.",

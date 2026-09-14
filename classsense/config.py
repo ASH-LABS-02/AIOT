@@ -24,6 +24,10 @@ THRESH_PATH  = os.path.join(MODELS_DIR, "threshold.pkl")
 META_PATH    = os.path.join(MODELS_DIR, "model_meta.json")
 MP_MODEL     = os.path.join(SCRIPTS_DIR, "face_landmarker.task")
 YOLO_WEIGHTS = os.path.join(REPO_ROOT, "yolov8n.pt")
+# NCNN export, built for ARM NEON. Produced by scripts/export_ncnn.py and
+# selected only when calibration measures it faster on this machine - on x86
+# it measured slower than PyTorch, so it is not a universal win.
+YOLO_NCNN_DIR = os.path.join(REPO_ROOT, "yolov8n_ncnn_model")
 
 MP_MODEL_URL = (
     "https://storage.googleapis.com/mediapipe-models/"

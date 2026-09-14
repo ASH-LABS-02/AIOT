@@ -29,6 +29,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from classsense import capacity as cap_mod                      # noqa: E402
 from classsense import config                                   # noqa: E402
 from classsense.capacity import Capacity, default_pool_size     # noqa: E402
+from classsense.detector import (                                # noqa: E402
+    ncnn_available, ncnn_export_width, load_detector,
+)
 from classsense.mp_pool import MediaPipePool, ensure_model      # noqa: E402
 import mediapipe as mp                                          # noqa: E402
 
@@ -107,7 +110,7 @@ def measure_per_face(frame, pool_size, trials=25):
     return statistics.median(per_batch)
 
 
-def measure_detect(frame, width, capture_size, trials=6):
+def measure_detect(frame, width, capture_size, trials=6, backend="pytorch"):
     """
     Cost AND reliability of one YOLO pass at this input width.
 
@@ -121,8 +124,9 @@ def measure_detect(frame, width, capture_size, trials=6):
     The frame is scaled to the capture size the pipeline will actually use, so
     the measurement reflects deployment rather than whatever clip was handy.
     """
-    from ultralytics import YOLO
-    yolo = YOLO(config.YOLO_WEIGHTS)
+    yolo, actual = load_detector(backend=backend, yolo_width=width, strict=False)
+    if actual != backend:
+        return None            # asked for NCNN, could not have it at this width
     full = cv2.resize(frame, capture_size, interpolation=cv2.INTER_LINEAR)
 
     for _ in range(2):
@@ -147,6 +151,7 @@ def measure_detect(frame, width, capture_size, trials=6):
         # The same frame every time, so any variation in the count is the
         # detector being unstable rather than the scene changing.
         "stable": len(set(found)) == 1,
+        "backend": backend,
     }
 
 
@@ -202,22 +207,55 @@ def main():
     print("\n" + RULE)
     print("2. Person detection cost by input width")
     print(RULE)
-    print(f"{'width':>7} {'ms':>9} {'people':>8} {'conf':>7}  detection")
-    print("-" * 52)
+    # Both backends are measured rather than assumed. NCNN is built for ARM
+    # NEON and is the point of exporting at all on a Pi, but on x86 it measured
+    # SLOWER than PyTorch (53ms against 29ms at 640px). Neither is universally
+    # right, so the machine decides.
+    backends = ["pytorch"]
+    if ncnn_available():
+        exported = ncnn_export_width(config.YOLO_NCNN_DIR)
+        backends.append("ncnn")
+        print(f"NCNN export found (width {exported}); measuring both backends.")
+        if exported is not None and exported not in args.widths:
+            print(f"  Only {exported}px can use NCNN - an export has a fixed")
+            print("  input shape and returns nothing at any other width.")
+    else:
+        print("No NCNN export. For ARM, see scripts/export_ncnn.py.")
+    print()
+
+    print(f"{'backend':<9} {'width':>6} {'ms':>8} {'people':>8} {'conf':>7}  detection")
+    print("-" * 60)
     detect_costs = {}
     detect_info = {}
     for width in args.widths:
-        info = measure_detect(frame, width, (frame_w, frame_h))
-        detect_costs[width] = info["ms"]
-        detect_info[width] = info
-        if info["people"] == 0:
-            verdict = "FINDS NOBODY"
-        elif not info["stable"]:
-            verdict = "unstable count"
-        else:
-            verdict = "ok"
-        print(f"{width:>7} {info['ms']:>8.0f} {info['people']:>8.0f} "
-              f"{info['conf']:>7.2f}  {verdict}")
+        for backend in backends:
+            info = measure_detect(frame, width, (frame_w, frame_h),
+                                  backend=backend)
+            if info is None:
+                print(f"{backend:<9} {width:>6} {'-':>8} "
+                      f"{'-':>8} {'-':>7}  unavailable at this width")
+                continue
+            if info["people"] == 0:
+                verdict = "FINDS NOBODY"
+            elif not info["stable"]:
+                verdict = "unstable count"
+            else:
+                verdict = "ok"
+            print(f"{backend:<9} {width:>6} {info['ms']:>8.0f} "
+                  f"{info['people']:>8.0f} {info['conf']:>7.2f}  {verdict}")
+
+            # Keep whichever backend is both usable and faster at this width.
+            best_here = detect_info.get(width)
+            usable = info["people"] > 0
+            if best_here is None or (usable and info["ms"] < best_here["ms"]):
+                if usable or best_here is None:
+                    detect_info[width] = info
+                    detect_costs[width] = info["ms"]
+    print()
+    chosen_backends = {w: detect_info[w]["backend"] for w in detect_info}
+    if len(set(chosen_backends.values())) > 1 or "ncnn" in chosen_backends.values():
+        print("Fastest backend per width: "
+              + ", ".join(f"{w}px={b}" for w, b in sorted(chosen_backends.items())))
 
     # A width finding more people than another, at lower confidence, on the
     # same frame has two readings and this tool cannot tell them apart:
@@ -277,6 +315,7 @@ def main():
                 yolo_width=width,
                 detect_every=every,
                 samples_per_gate=args.samples_per_gate,
+                backend=detect_info[width]["backend"],
             )
             n = candidate.max_students(frame_w, frame_h)
             if n <= 0:

@@ -86,6 +86,61 @@ To see the trade-offs without committing:
 python scripts/calibrate.py --dry-run
 ```
 
+## 4b. Export YOLO to NCNN
+
+NCNN is built around ARM NEON and is the single largest speedup available on a
+Pi without added hardware.
+
+```bash
+python scripts/export_ncnn.py --imgsz 640 --verify
+```
+
+```bash
+python scripts/calibrate.py
+```
+
+Calibration then measures **both** backends and records whichever is actually
+faster on this machine. Nothing here assumes NCNN wins — on x86 it measured
+53ms against PyTorch's 29ms at 640px, and calibration correctly kept PyTorch
+there. On ARM the ordering is expected to reverse; the machine decides.
+
+**The one thing to get right.** An NCNN export has a *fixed input shape*. A
+640px export run at 960px returns **zero detections** — no exception, no
+warning, an empty list. Measured on a real export: 1 person found at 640, none
+at 960, identical frame. In a classroom that reads as an empty room while
+everything downstream keeps working perfectly.
+
+So the export width is recorded beside the model and a mismatch is refused at
+load time. If you change `yolo_width`, re-export:
+
+```bash
+python scripts/export_ncnn.py --imgsz <new width> --verify --force
+```
+
+`--verify` checks the export actually detects people at its own width, and
+demonstrates the empty result at the wrong one. Worth the extra minute: a
+broken export looks exactly like a working one until deployed.
+
+The export is gitignored — it is a 12MB binary, rebuildable in seconds, and
+bound to one width.
+
+### How much this buys
+
+On the Pi 5 estimates (`detect_ms ≈ 320`, `per_face_ms ≈ 12.5`, budget 267ms):
+
+| detection | students |
+|---|---|
+| PyTorch, ~320ms | ~12 |
+| NCNN, ~110ms | ~18 |
+| free (hypothetical) | ~21 |
+
+Real, but bounded. Landmark cost per face is untouched by NCNN, so **~21 is the
+hard ceiling** even if detection cost went to zero. MediaPipe is already on
+XNNPACK's ARM path, so there is little left there. Past that point the next
+step is an accelerator, not a faster detector.
+
+---
+
 ## 5. Run
 
 ```bash
@@ -185,9 +240,9 @@ If it cannot reach 20 it says so rather than pretending.
 - **Detection width must suit the source.** Running YOLO far above the camera's
   native resolution makes its boxes unstable and spawns duplicate tracks.
   Calibration now measures this, but only against the frame you give it.
-- **NCNN export is not wired up.** Ultralytics can export YOLOv8n to NCNN, which
-  is typically 2–3× faster than PyTorch on ARM. That is the single largest
-  remaining speedup available here and would directly raise the student cap.
+- **NCNN's ARM speedup is unverified by the author.** It is wired up, measured
+  correct, and measured *slower* on x86 — which is expected, since its advantage
+  is NEON. Calibration measures both on your Pi rather than trusting the claim.
 - **The Pi has not been tested by the author.** Every Pi figure in this file is
   extrapolated from x86 measurements. Calibration exists precisely so the
   machine tells you the truth rather than inheriting my guesses — trust its
