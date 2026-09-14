@@ -16,6 +16,8 @@ MODELS_DIR   = os.path.join(REPO_ROOT, "models")
 SCRIPTS_DIR  = os.path.join(REPO_ROOT, "scripts")
 SNAPSHOT_DIR = os.path.join(DATA_DIR, "snapshots")
 
+TUNING_PATH  = os.path.join(REPO_ROOT, "classsense", "tuning.json")
+
 MODEL_PATH   = os.path.join(MODELS_DIR, "engagement_classifier.pkl")
 SCALER_PATH  = os.path.join(MODELS_DIR, "scaler.pkl")
 THRESH_PATH  = os.path.join(MODELS_DIR, "threshold.pkl")
@@ -167,11 +169,28 @@ FACE_WIDTH_TO_HEIGHT = 0.887
 # so every student is re-examined ~4.3x per second and the whole cohort fits
 # in every cycle. MAX_STUDENTS_PER_CYCLE is the degradation path for slower
 # machines, not the normal operating mode here.
-MP_POOL_SIZE           = 8
+MP_POOL_SIZE           = 8     # overridden per-machine, see classsense.capacity
 MP_CROP_MAX_SIDE       = 192   # above this MediaPipe costs double for nothing
 YOLO_INPUT_WIDTH       = 1280  # 1280 over 960: back-row students are small
 MAX_STUDENTS_PER_CYCLE = 60
 CROP_PADDING           = 20    # px of context around a YOLO box
+
+# How many times a temporal gate must be sampled inside its own window for the
+# state that depends on it to be trustworthy.
+#
+# This is the number that decides how many students a machine may watch, and it
+# is a fidelity requirement rather than a performance target. A student examined
+# every 1.5s can have a 1.2s eye closure fall entirely between two samples, and
+# then a sleeping student reads as attentive - a confident wrong answer, which
+# is worse than no answer. classsense.capacity turns this into a student cap for
+# whatever machine it is running on; see scripts/calibrate.py.
+FIDELITY_SAMPLES_PER_GATE = 3
+
+# Students beyond the measured capacity are tracked and counted as present, but
+# their engagement is reported as Unmonitored rather than analysed at a rate too
+# slow to mean anything. Set False to let the adaptive scheduler rotate through
+# everyone at reduced fidelity instead.
+REFUSE_BEYOND_CAPACITY = True
 
 # Cycles between YOLO passes. Profiling a 60-student cycle put YOLO at 124ms
 # of 263ms - 47% - spent re-finding people who have not moved. Seated students

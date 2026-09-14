@@ -26,7 +26,7 @@ import numpy as np
 from classsense.config import (
     YOLO_CONF_THRESH, YOLO_INPUT_WIDTH, MP_POOL_SIZE, MP_FACE_CONF_THRESH,
     MAX_STUDENTS_PER_CYCLE, CROP_PADDING, CAPTURE_WIDTH, CAPTURE_HEIGHT,
-    CAPTURE_INDEX, YOLO_WEIGHTS, DETECT_EVERY,
+    CAPTURE_INDEX, YOLO_WEIGHTS, DETECT_EVERY, REFUSE_BEYOND_CAPACITY,
 )
 from classsense.geometry import (
     extract_feature_row, face_size_px, face_centre_in_frame,
@@ -117,7 +117,8 @@ class AnalysisWorker:
     def __init__(self, classifier=None, scaler=None, threshold=0.5,
                  pool_size=MP_POOL_SIZE, yolo_width=YOLO_INPUT_WIDTH,
                  max_per_cycle=MAX_STUDENTS_PER_CYCLE,
-                 detect_every=DETECT_EVERY):
+                 detect_every=DETECT_EVERY,
+                 refuse_beyond_capacity=REFUSE_BEYOND_CAPACITY):
         from ultralytics import YOLO
 
         self.yolo = YOLO(YOLO_WEIGHTS)
@@ -130,6 +131,8 @@ class AnalysisWorker:
         self.yolo_width = yolo_width
         self.max_per_cycle = max_per_cycle
         self.detect_every = max(1, detect_every)
+        self.refuse_beyond_capacity = refuse_beyond_capacity
+        self.over_capacity = 0
         self._since_detect = 0          # 0 means "detect on the next cycle"
 
         self.tracker = StudentTracker()
@@ -190,6 +193,19 @@ class AnalysisWorker:
             if run_detect:
                 self.tracker.update(boxes, now)
             batch = self.tracker.schedule(self.max_per_cycle, now)
+
+            # Anyone past capacity is still tracked and still counted, but is
+            # reported Unmonitored rather than given a state derived from a
+            # sampling rate too slow to support it.
+            if self.refuse_beyond_capacity:
+                scheduled = {s.track_id for s in batch}
+                overflow = [
+                    s for s in self.tracker.students.values()
+                    if s.track_id not in scheduled and s.face_confirmed
+                ]
+                for student in overflow:
+                    student.engagement.mark_unmonitored()
+                self.over_capacity = len(overflow)
 
         # Landmark extraction, fanned across the pool. This is the parallel
         # section and the reason 60 students fit in a cycle: detect() releases

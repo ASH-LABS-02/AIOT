@@ -68,10 +68,12 @@ def states_available(tier):
 
 
 STATE_COLORS = {
-    "Attentive":  GREEN,
-    "Sleepy":     ORANGE,
-    "Distracted": RED,
-    "Unknown":    GRAY,
+    "Attentive":   GREEN,
+    "Sleepy":      ORANGE,
+    "Distracted":  RED,
+    "Unknown":     GRAY,
+    # Beyond measured capacity: present and counted, deliberately not judged.
+    "Unmonitored": GRAY,
 }
 
 

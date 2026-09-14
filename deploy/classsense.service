@@ -1,0 +1,65 @@
+# deploy/classsense.service
+# systemd unit for running ClassSense headless on a Raspberry Pi.
+#
+#   sudo cp deploy/classsense.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now classsense
+#   journalctl -u classsense -f
+#
+# Adjust User and the paths if the checkout is not at /home/pi/machine_learning.
+
+[Unit]
+Description=ClassSense AI classroom engagement monitor
+# The camera may not be enumerated the instant the network is up, so wait for
+# the device rather than racing it. Change to your camera's device node.
+After=network-online.target dev-video0.device
+Wants=network-online.target
+BindsTo=dev-video0.device
+
+[Service]
+Type=simple
+User=pi
+Group=video
+WorkingDirectory=/home/pi/machine_learning
+
+# Headless, serving the view and status on port 8080.
+# --stream-fps 5 keeps JPEG encoding off the cores that should be doing
+# analysis; the analysis rate is what determines whether the states mean
+# anything, not how smooth the video looks.
+ExecStart=/home/pi/machine_learning/classsense-env/bin/python -u \
+    scripts/live_detect.py --headless --serve 8080 --stream-fps 5
+
+# Refuse to start on a machine that has never been calibrated. Running with
+# desktop constants on a Pi does not fail loudly - it samples too slowly for
+# the temporal gates and reports confident states anyway, which is worse.
+ExecStartPre=/bin/sh -c 'test -f /home/pi/machine_learning/classsense/tuning.json || \
+    { echo "No tuning.json. Run: python scripts/calibrate.py"; exit 1; }'
+
+Restart=on-failure
+RestartSec=10
+
+# A camera that disappears takes the process with it; do not spin on it.
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+# MediaPipe and OpenCV each spawn their own worker threads. Left alone they
+# both size themselves to the core count and oversubscribe four cores badly,
+# which shows up as worse throughput than a single thread. The detector pool
+# provides the parallelism; the libraries underneath should stay sequential.
+Environment=OMP_NUM_THREADS=1
+Environment=OPENBLAS_NUM_THREADS=1
+Environment=MKL_NUM_THREADS=1
+Environment=PYTHONUNBUFFERED=1
+# Silence MediaPipe's telemetry upload retries, which otherwise fill the log.
+Environment=GLOG_minloglevel=2
+
+# Modest hardening. The service needs the camera and its own directory, and
+# nothing else.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/pi/machine_learning/data /home/pi/machine_learning/classsense
+
+[Install]
+WantedBy=multi-user.target

@@ -7,6 +7,43 @@ landmarks with MediaPipe, and classifies each student as **Attentive**, **Sleepy
 Measured at **60 students in a single 1080p frame at 6.0 analysis cycles per second on
 CPU** — every student re-examined roughly six times a second, no GPU.
 
+Deploying to a Raspberry Pi? **Read [deploy/README-raspberry-pi.md](deploy/README-raspberry-pi.md)
+first, and run `scripts/calibrate.py` before anything else.** Every figure below was
+measured on a 20-core desktop; inheriting those constants on four slower cores does not
+produce a slow system, it produces a confidently wrong one.
+
+---
+
+## Capacity — how many students this machine may watch
+
+The student cap is a measured consequence, not a setting. It follows from one
+requirement: **every temporal gate must be sampled several times inside its own window.**
+The shortest gate is `DISTRACTED_DURATION` at 0.8s and the default asks for 3 samples, so
+the refresh must stay under 0.27s.
+
+This matters because the failure is silent. A student examined every two seconds can sleep
+through a lesson reading "Attentive" — the pipeline still runs, still draws boxes, still
+prints an engagement percentage. Nothing looks broken.
+
+Two ceilings apply, and capacity is the lower of them:
+
+- **Compute** — how many faces fit inside the refresh budget. Binds on a Pi.
+- **Resolution** — how many faces the camera can resolve above the tier floor. Binds on a
+  wide 1080p shot; the model independently puts this near 62, which is where the measured
+  60-student design point sits.
+
+```bash
+python scripts/calibrate.py
+```
+
+Measures this machine and writes `classsense/tuning.json` — gitignored, because it
+describes one machine. Without it the pipeline falls back to an estimate from the core
+count and says so on every start.
+
+Students beyond capacity are tracked and counted but reported **`Unmonitored`** rather than
+given a state the sampling rate cannot support. `--allow-over-capacity` rotates everyone
+through at reduced fidelity instead.
+
 ---
 
 ## Quick start
@@ -23,6 +60,16 @@ python scripts/live_detect.py
 
 Keys: `Q` quit · `S` snapshot · `D` telemetry HUD.
 
+Headless, with a web view and JSON status — for a Pi, or any machine with no display:
+
+```bash
+python scripts/live_detect.py --headless --serve 8080
+```
+
+`/` live view and tallies · `/stream` MJPEG · `/status` JSON · `/snapshot` one JPEG.
+There is no authentication and it streams a live camera feed of a room, so keep it on a
+trusted network.
+
 Every script runs from the repo root and resolves its own paths, so none of them care
 which directory you launch from.
 
@@ -36,6 +83,7 @@ which directory you launch from.
 | **Sleepy** | orange | eyes closed ≥ 1.2s, yawn ≥ 1.5s, or head nodding with eyes closing |
 | **Distracted** | red | head turned/reclined/tilted ≥ 0.8s, or face lost ≥ 0.5s |
 | **Unknown** | gray | face too small to read reliably — see tiers below |
+| **Unmonitored** | gray | present, but beyond this machine's measured capacity |
 
 Every trigger is **wall-clock gated**, not frame-counted. A blink and a microsleep look
 identical in one frame and differ only in duration, so the system waits before committing.
@@ -172,6 +220,8 @@ classsense/            the package — importable, testable, no entry points
   states.py            the temporal state machine
   render.py            overlay and dashboard
   pipeline.py          capture / analysis / render threading
+  capacity.py          what this machine may honestly watch
+  server.py            MJPEG + JSON output, standard library only
 
 scripts/
   live_detect.py       live detection (entry point)
@@ -180,9 +230,10 @@ scripts/
   extract_features.py  DAiSEE clips -> features
   train_model.py       train + subject-independent evaluation
   check_paths.py       what dataset is actually on disk
+  calibrate.py         measure THIS machine, write its tuning
   diagnose_duplicates.py  why one person is being counted as more than one
 
-tests/                 86 tests
+tests/                 117 tests
 ```
 
 `geometry.py` is imported by **both** the training extractor and the live pipeline. That
@@ -249,6 +300,6 @@ confirmation and the room read as permanently empty.
   identities and with them their temporal history.
 - **A student who moves far enough to break box association can read as two for up to
   0.6s** before the abandoned track leaves the presence window. The duplicate cannot be
-  removed outright � for a moment an abandoned track and a briefly-occluded one are
-  genuinely indistinguishable � but it is a flicker rather than a standing miscount.
+  removed outright — for a moment an abandoned track and a briefly-occluded one are
+  genuinely indistinguishable — but it is a flicker rather than a standing miscount.
 - **13 subjects** bounds everything the classifier can claim.

@@ -264,7 +264,8 @@ class StudentTracker:
     def counts(self, now=None):
         """Tally of present students by state, for the dashboard."""
         now = now or time.time()
-        tally = {"Attentive": 0, "Sleepy": 0, "Distracted": 0, "Unknown": 0}
+        tally = {"Attentive": 0, "Sleepy": 0, "Distracted": 0,
+                 "Unknown": 0, "Unmonitored": 0}
         for student in self.confirmed(now).values():
             tally[student.state] = tally.get(student.state, 0) + 1
         return tally

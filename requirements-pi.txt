@@ -1,0 +1,41 @@
+# ClassSense on Raspberry Pi 5 (64-bit Raspberry Pi OS, Python 3.11+).
+#
+# Install torch FIRST, from the CPU index, or pip may resolve a much larger
+# build as an ultralytics dependency:
+#
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+#   pip install -r requirements-pi.txt
+#
+# Versions are floors rather than pins. The desktop requirements.txt pins exact
+# versions because those are what the measurements were taken against; on ARM
+# the available wheels differ per distro release, and pinning to an x86 build
+# set mostly produces resolver failures.
+#
+# Then, before running anything:   python scripts/calibrate.py
+
+# Vision. opencv-python-headless, not opencv-python: the Pi runs headless and
+# the GUI build pulls in a large GTK/Qt dependency chain for a window that will
+# never be opened. If you do want a window on an attached display, swap it for
+# opencv-python.
+opencv-python-headless>=4.9
+mediapipe>=0.10.9
+ultralytics>=8.1
+
+# Modelling. Needed to LOAD the classifier, not to train on the Pi - train on a
+# desktop and copy models/ across. scikit-learn builds from source on ARM if no
+# wheel matches, which takes a long time on four cores.
+scikit-learn>=1.4
+joblib>=1.3
+
+numpy>=1.26
+
+# Deliberately absent, and why:
+#
+#   pandas, matplotlib, imbalanced-learn  - training and plotting only. The Pi
+#       loads a pre-trained model; it never extracts features or fits anything.
+#       Leaving them out saves a long build and a few hundred MB.
+#
+#   pytest - install it if you want to run the suite on the Pi:
+#       pip install pytest && python -m pytest tests/ -q
+#       Worth doing once after install to confirm the geometry and tracking
+#       behave the same on ARM as they do on x86.

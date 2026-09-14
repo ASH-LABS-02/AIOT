@@ -48,6 +48,12 @@ data/raw/
 data/processed/
 snapshots/
 
+# Per-machine calibration written by scripts/calibrate.py. Deliberately NOT
+# tracked: it describes the timings of one specific machine, and committing a
+# desktop's file would see a Raspberry Pi silently inherit a 20-core tuning -
+# exactly the failure classsense/capacity.py exists to prevent.
+classsense/tuning.json
+
 # ...but the model card is tracked. It is a few hundred bytes, it records the
 # honest out-of-fold metrics, and live_detect.py reads its advisory_only flag
 # to decide whether the classifier may influence a student's state. Shipping

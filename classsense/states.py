@@ -268,6 +268,21 @@ class EngagementState:
         else:
             self._set_state("Attentive", "Engaged", float(1.0 - drift_proba))
 
+    def mark_unmonitored(self):
+        """
+        Present, but beyond what this machine can watch properly.
+
+        The alternative - rotating everyone through at whatever rate the
+        hardware manages - produces states that look identical to trustworthy
+        ones while being sampled too rarely to catch the events they name. A
+        student examined every two seconds can sleep through a whole lesson
+        reading "Attentive". Saying "Unmonitored" is the honest output, and it
+        tells the operator to add hardware or narrow the camera rather than
+        quietly believing a number.
+        """
+        self.pending_model = False
+        self._set_state("Unmonitored", "Beyond capacity", 0.0)
+
     def mark_face_lost(self, confirmed, now=None):
         """
         No landmarks this cycle.
